@@ -39,6 +39,8 @@ def BYTES_FN(s, dt_bytes):
 import torch
 import torch.nn.functional as F
 
+FUSE_BATCHNORM_ACT = True
+
 
 def kernel_fn(
     x: torch.Tensor,
