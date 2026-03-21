@@ -1100,6 +1100,8 @@ class OptimizedModelContext:
     def _replace_conv2d_modules_with_dispatch(self, repls: List[KernelReplacement]) -> int:
         dispatch_fn = self._build_conv_dispatch_fn(repls)
         has_generic = any(r.generic_fallback for r in repls)
+        direct_kernel_fn = repls[0].module_fn if len(repls) == 1 and not has_generic else None
+        wrapper_kernel_fn = direct_kernel_fn or dispatch_fn
         candidate_shapes = [r.model_shapes for r in repls if isinstance(r.model_shapes, dict)]
         fusion_shapes = [
             r.model_shapes
@@ -1150,7 +1152,7 @@ class OptimizedModelContext:
                             fused_parent.conv,
                             fused_norm,
                             fused_act,
-                            dispatch_fn,
+                            wrapper_kernel_fn,
                         ),
                     )
                     replaced_parent_names.add(parent_name)
@@ -1158,7 +1160,7 @@ class OptimizedModelContext:
                     continue
 
             self._original_modules[name] = module
-            wrapper = _Conv2dWrapper(module, dispatch_fn)
+            wrapper = _Conv2dWrapper(module, wrapper_kernel_fn)
             parent_module, attr = _get_named_parent(self.model, name)
             if parent_module is None or attr is None:
                 continue
