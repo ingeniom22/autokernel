@@ -154,7 +154,7 @@ def kernel_fn(
 
     if n_rows <= 128 and n_cols <= 128:
         block_size = 128
-        rows_per_program = 8
+        rows_per_program = 16
         grid = (triton.cdiv(n_rows, rows_per_program),)
         layernorm_small_kernel[grid](
             x, y,
@@ -166,7 +166,7 @@ def kernel_fn(
             eps,
             BLOCK_SIZE=block_size,
             ROWS_PER_PROGRAM=rows_per_program,
-            num_warps=2,
+            num_warps=1,
             num_stages=2,
         )
     else:
