@@ -97,7 +97,7 @@ def kernel_fn(x: torch.Tensor) -> torch.Tensor:
     BLOCK_SIZE = triton.next_power_of_2(n_cols)
     if n_cols >= 16384:
         num_warps = 8
-        num_stages = 2
+        num_stages = 1
     elif n_cols >= 4096:
         num_warps = 4
         num_stages = 2
