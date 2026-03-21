@@ -70,6 +70,13 @@ class KernelReplacement:
     optimized_path: str       # path to optimized kernel .py file
     module_fn: Optional[Callable] = None  # loaded kernel function
     reinsert_supported: bool = False
+    model_shapes: Optional[Dict[str, int]] = None
+    generic_fallback: bool = False
+    fuse_batchnorm_act: bool = False
+    global_channels_last: bool = False
+    verify_atol: Optional[float] = None
+    verify_rtol: Optional[float] = None
+    status: Optional[str] = None
 
 
 @dataclass
@@ -329,6 +336,8 @@ def discover_optimized_kernels() -> List[KernelReplacement]:
     Checks orchestration_state.json first, then scans for *_optimized.py files.
     """
     replacements: List[KernelReplacement] = []
+    seen_paths: set[str] = set()
+    state_known_paths: set[str] = set()
 
     # Strategy 1: Read orchestration state
     state = load_orchestration_state()
@@ -336,7 +345,10 @@ def discover_optimized_kernels() -> List[KernelReplacement]:
         for k in state["kernels"]:
             ktype = k.get("op_type", k.get("type", "unknown"))
             rank = k.get("rank", 0)
-            speedup = k.get("speedup", k.get("best_speedup", 1.0))
+            speedup = k.get(
+                "end_to_end_speedup",
+                k.get("speedup", k.get("best_speedup", 1.0)),
+            )
             # optimized_path is not written by orchestrate.py, so derive it
             # from the kernel file path if available
             opt_path = k.get("optimized_path", "")
@@ -355,7 +367,14 @@ def discover_optimized_kernels() -> List[KernelReplacement]:
                         WORKSPACE_DIR, f"kernel_{ktype}_{rank}_optimized.py"
                     )
 
-            if os.path.exists(opt_path) and speedup > 1.0:
+            state_known_paths.add(os.path.abspath(opt_path))
+
+            include_candidate = os.path.exists(opt_path) and (
+                (speedup is not None and speedup > 1.0)
+                or k.get("status") == "optimizing"
+            )
+
+            if include_candidate:
                 support_stage = build_support_stage(ktype, {ktype})
                 replacements.append(KernelReplacement(
                     kernel_type=ktype,
@@ -363,8 +382,9 @@ def discover_optimized_kernels() -> List[KernelReplacement]:
                     speedup=speedup,
                     optimized_path=opt_path,
                     reinsert_supported=support_stage["reinsert_supported"],
+                    status=k.get("status"),
                 ))
-        return replacements
+                seen_paths.add(os.path.abspath(opt_path))
 
     # Strategy 2: Scan workspace directory for optimized kernel files
     if not os.path.isdir(WORKSPACE_DIR):
@@ -389,6 +409,16 @@ def discover_optimized_kernels() -> List[KernelReplacement]:
                 # Everything between parts[1] and the rank index is the type
                 ktype = "_".join(parts[1:rank_idx]) if rank_idx > 1 else parts[1]
                 opt_path = os.path.join(WORKSPACE_DIR, fname)
+                if os.path.abspath(opt_path) in state_known_paths:
+                    continue
+                if os.path.abspath(opt_path) in seen_paths:
+                    continue
+                try:
+                    extra_mod = load_kernel_module(opt_path)
+                except Exception:
+                    continue
+                if not bool(getattr(extra_mod, "INCLUDE_WITHOUT_STATE", False)):
+                    continue
                 support_stage = build_support_stage(ktype, {ktype})
                 replacements.append(KernelReplacement(
                     kernel_type=ktype,
@@ -396,6 +426,7 @@ def discover_optimized_kernels() -> List[KernelReplacement]:
                     speedup=0.0,  # Unknown without state file
                     optimized_path=opt_path,
                     reinsert_supported=support_stage["reinsert_supported"],
+                    status="optimizing",
                 ))
 
     return replacements
@@ -411,6 +442,31 @@ def load_kernel_module(path: str) -> Any:
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def split_replacements_for_verification(
+    replacements: List[KernelReplacement],
+) -> Tuple[List[KernelReplacement], List[KernelReplacement]]:
+    """
+    Split discovered kernels into:
+    - reference replacements: accepted stack that should be active in the baseline run
+    - optimized replacements: reference stack plus the current in-progress candidate(s)
+    """
+    has_optimizing = any(r.status == "optimizing" for r in replacements)
+    if not has_optimizing:
+        return [], replacements
+
+    reference_replacements: List[KernelReplacement] = []
+    candidate_replacements: List[KernelReplacement] = []
+    for repl in replacements:
+        if repl.status == "optimizing":
+            candidate_replacements.append(repl)
+        elif repl.speedup is not None and repl.speedup > 1.0:
+            reference_replacements.append(repl)
+
+    if not candidate_replacements:
+        return [], replacements
+    return reference_replacements, reference_replacements + candidate_replacements
 
 
 class _LinearWrapper(nn.Module):
@@ -444,6 +500,115 @@ class _LinearWrapper(nn.Module):
             out = out.reshape(*orig_shape[:-1], out.shape[-1])
 
         return out
+
+
+class _Conv2dWrapper(nn.Module):
+    """Wraps nn.Conv2d to use an optimized kernel_fn."""
+
+    def __init__(self, original: nn.Conv2d, kernel_fn: Callable):
+        super().__init__()
+        self.original = original
+        self.kernel_fn = kernel_fn
+        self.weight = original.weight
+        self.bias = original.bias
+        self.stride = original.stride
+        self.padding = original.padding
+        self.dilation = original.dilation
+        self.groups = original.groups
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.kernel_fn(
+            x,
+            self.weight,
+            self.bias,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+            groups=self.groups,
+        )
+
+
+class _ConvBnActFusedWrapper(nn.Module):
+    """Inference-only Conv+BatchNorm(+ReLU/Identity) wrapper using a conv kernel."""
+
+    def __init__(
+        self,
+        conv: nn.Conv2d,
+        bn: nn.BatchNorm2d,
+        act: nn.Module,
+        kernel_fn: Callable,
+    ):
+        super().__init__()
+        self.kernel_fn = kernel_fn
+        self.stride = conv.stride
+        self.padding = conv.padding
+        self.dilation = conv.dilation
+        self.groups = conv.groups
+        self.act = act
+
+        with torch.no_grad():
+            weight_fp32 = conv.weight.detach().float()
+            conv_bias_fp32 = (
+                conv.bias.detach().float()
+                if conv.bias is not None
+                else torch.zeros(conv.out_channels, device=weight_fp32.device, dtype=torch.float32)
+            )
+            bn_weight_fp32 = bn.weight.detach().float()
+            bn_bias_fp32 = bn.bias.detach().float()
+            running_mean_fp32 = bn.running_mean.detach().float()
+            running_var_fp32 = bn.running_var.detach().float()
+            scale_fp32 = bn_weight_fp32 / torch.sqrt(running_var_fp32 + bn.eps)
+            folded_weight = weight_fp32 * scale_fp32.reshape(-1, 1, 1, 1)
+            folded_bias = bn_bias_fp32 + (conv_bias_fp32 - running_mean_fp32) * scale_fp32
+
+        self.register_buffer(
+            "folded_weight",
+            folded_weight.to(dtype=conv.weight.dtype).contiguous(memory_format=torch.channels_last),
+            persistent=False,
+        )
+        self.register_buffer(
+            "folded_bias",
+            folded_bias.to(dtype=conv.weight.dtype),
+            persistent=False,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim == 4 and not x.is_contiguous(memory_format=torch.channels_last):
+            x = x.contiguous(memory_format=torch.channels_last)
+        y = self.kernel_fn(
+            x,
+            self.folded_weight,
+            self.folded_bias,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+            groups=self.groups,
+        )
+        return self.act(y)
+
+
+class _BatchNormWrapper(nn.Module):
+    """Wraps BatchNorm modules to use an optimized kernel_fn."""
+
+    def __init__(self, original: nn.Module, kernel_fn: Callable):
+        super().__init__()
+        self.original = original
+        self.kernel_fn = kernel_fn
+        self.weight = original.weight
+        self.bias = original.bias
+        self.running_mean = original.running_mean
+        self.running_var = original.running_var
+        self.eps = original.eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.kernel_fn(
+            x,
+            self.weight,
+            self.bias,
+            self.running_mean,
+            self.running_var,
+            eps=self.eps,
+        )
 
 
 class _LayerNormWrapper(nn.Module):
@@ -515,6 +680,107 @@ class _RMSNormWrapper(nn.Module):
         return out
 
 
+def _pair_or_none(value: Any) -> Optional[Tuple[int, int]]:
+    if isinstance(value, tuple) and len(value) == 2:
+        return int(value[0]), int(value[1])
+    if isinstance(value, list) and len(value) == 2:
+        return int(value[0]), int(value[1])
+    if isinstance(value, int):
+        return value, value
+    return None
+
+
+def _conv_signature_from_shape(shape: Dict[str, int]) -> Optional[Tuple[int, ...]]:
+    keys = (
+        "N", "C_in", "C_out", "H", "W", "KH", "KW",
+        "stride_h", "stride_w", "pad_h", "pad_w", "dil_h", "dil_w", "groups",
+    )
+    if not all(k in shape for k in keys):
+        return None
+    return tuple(int(shape[k]) for k in keys)
+
+
+def _conv_signature_from_inputs(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    stride: Any,
+    padding: Any,
+    dilation: Any,
+    groups: int,
+) -> Optional[Tuple[int, ...]]:
+    stride_hw = _pair_or_none(stride)
+    padding_hw = _pair_or_none(padding)
+    dilation_hw = _pair_or_none(dilation)
+    if stride_hw is None or padding_hw is None or dilation_hw is None:
+        return None
+    return (
+        int(x.shape[0]),
+        int(x.shape[1]),
+        int(weight.shape[0]),
+        int(x.shape[2]),
+        int(x.shape[3]),
+        int(weight.shape[2]),
+        int(weight.shape[3]),
+        int(stride_hw[0]),
+        int(stride_hw[1]),
+        int(padding_hw[0]),
+        int(padding_hw[1]),
+        int(dilation_hw[0]),
+        int(dilation_hw[1]),
+        int(groups),
+    )
+
+
+def _batchnorm_signature_from_shape(shape: Dict[str, int]) -> Optional[Tuple[int, ...]]:
+    keys = ("N", "C", "H", "W")
+    if not all(k in shape for k in keys):
+        return None
+    return tuple(int(shape[k]) for k in keys)
+
+
+def _batchnorm_signature_from_input(x: torch.Tensor) -> Optional[Tuple[int, ...]]:
+    if x.ndim != 4:
+        return None
+    return (int(x.shape[0]), int(x.shape[1]), int(x.shape[2]), int(x.shape[3]))
+
+
+def _conv_module_may_match_shape(shape: Dict[str, int], module: nn.Conv2d) -> bool:
+    kernel_size = _pair_or_none(module.kernel_size)
+    stride = _pair_or_none(module.stride)
+    dilation = _pair_or_none(module.dilation)
+    padding = _pair_or_none(module.padding)
+    if kernel_size is None or stride is None or dilation is None or padding is None:
+        return False
+    return (
+        shape.get("C_in") == module.in_channels
+        and shape.get("C_out") == module.out_channels
+        and shape.get("KH") == kernel_size[0]
+        and shape.get("KW") == kernel_size[1]
+        and shape.get("stride_h") == stride[0]
+        and shape.get("stride_w") == stride[1]
+        and shape.get("pad_h") == padding[0]
+        and shape.get("pad_w") == padding[1]
+        and shape.get("dil_h") == dilation[0]
+        and shape.get("dil_w") == dilation[1]
+        and shape.get("groups") == module.groups
+    )
+
+
+def _batchnorm_module_may_match_shape(shape: Dict[str, int], module: nn.Module) -> bool:
+    num_features = getattr(module, "num_features", None)
+    return num_features is not None and shape.get("C") == int(num_features)
+
+
+def _get_named_parent(model: nn.Module, name: str) -> Tuple[Optional[nn.Module], Optional[str]]:
+    if "." not in name:
+        return model, name
+    parts = name.split(".")
+    parent = model
+    for part in parts[:-1]:
+        parent = getattr(parent, part)
+    return parent, parts[-1]
+
+
 class OptimizedModelContext:
     """
     Context manager that patches a model's submodules to use optimized Triton kernels.
@@ -529,6 +795,9 @@ class OptimizedModelContext:
         self.replacements = replacements
         self._original_modules: Dict[str, nn.Module] = {}
         self._original_functionals: Dict[str, Any] = {}
+        self._original_forward: Optional[Callable[..., Any]] = None
+        self._restore_model_contiguous = False
+        self._input_transform: Optional[Callable[[Any], Any]] = None
         self._applied: List[str] = []
         self._applied_replacements: List[Dict[str, Any]] = []
         self._skipped_replacements: List[Dict[str, Any]] = []
@@ -537,6 +806,7 @@ class OptimizedModelContext:
         self._applied.clear()
         self._applied_replacements.clear()
         self._skipped_replacements.clear()
+        loaded_repls: List[KernelReplacement] = []
         for repl in self.replacements:
             try:
                 kernel_mod = load_kernel_module(repl.optimized_path)
@@ -553,6 +823,13 @@ class OptimizedModelContext:
                     )
                     continue
                 repl.module_fn = kernel_mod.kernel_fn
+                repl.model_shapes = getattr(kernel_mod, "MODEL_SHAPES", None)
+                repl.generic_fallback = bool(getattr(kernel_mod, "GENERIC_FALLBACK", False))
+                repl.fuse_batchnorm_act = bool(getattr(kernel_mod, "FUSE_BATCHNORM_ACT", False))
+                repl.global_channels_last = bool(getattr(kernel_mod, "GLOBAL_CHANNELS_LAST", False))
+                repl.verify_atol = getattr(kernel_mod, "VERIFY_ATOL", None)
+                repl.verify_rtol = getattr(kernel_mod, "VERIFY_RTOL", None)
+                loaded_repls.append(repl)
             except Exception as e:
                 print(f"  WARNING: Failed to load {repl.optimized_path}: {e}")
                 self._skipped_replacements.append(
@@ -566,38 +843,56 @@ class OptimizedModelContext:
                 )
                 continue
 
-            replaced = self._apply_replacement(repl)
-            if replaced > 0:
-                self._applied.append(
-                    f"  {repl.kernel_type} (rank {repl.rank}): "
-                    f"{repl.speedup:.1f}x -> {repl.optimized_path}"
-                )
-                self._applied_replacements.append(
-                    {
-                        "type": repl.kernel_type,
-                        "rank": repl.rank,
-                        "speedup": repl.speedup,
-                        "path": repl.optimized_path,
-                        "modules_replaced": replaced,
-                    }
-                )
+        handled_group_types: set[str] = set()
+        grouped: Dict[str, List[KernelReplacement]] = {}
+        for repl in loaded_repls:
+            grouped.setdefault(repl.kernel_type, []).append(repl)
+
+        for repl in loaded_repls:
+            if repl.kernel_type in {"conv2d", "batchnorm"}:
+                if repl.kernel_type in handled_group_types:
+                    continue
+                group = grouped.get(repl.kernel_type, [])
+                replaced = self._apply_group_replacement(repl.kernel_type, group)
+                handled_group_types.add(repl.kernel_type)
+                target_repls = group
             else:
-                if repl.reinsert_supported:
-                    reason = "No compatible modules found in the loaded model."
-                else:
-                    reason = (
-                        "No reinsertion strategy for this operator family. "
-                        "Current verifier support is limited to matmul, layernorm, rmsnorm, and softmax."
+                replaced = self._apply_replacement(repl)
+                target_repls = [repl]
+
+            for target in target_repls:
+                if replaced > 0:
+                    speedup_label = f"{target.speedup:.1f}x" if target.speedup is not None else "n/a"
+                    self._applied.append(
+                        f"  {target.kernel_type} (rank {target.rank}): "
+                        f"{speedup_label} -> {target.optimized_path}"
                     )
-                self._skipped_replacements.append(
-                    {
-                        "type": repl.kernel_type,
-                        "rank": repl.rank,
-                        "speedup": repl.speedup,
-                        "path": repl.optimized_path,
-                        "reason": reason,
-                    }
-                )
+                    self._applied_replacements.append(
+                        {
+                            "type": target.kernel_type,
+                            "rank": target.rank,
+                            "speedup": target.speedup,
+                            "path": target.optimized_path,
+                            "modules_replaced": replaced,
+                        }
+                    )
+                else:
+                    if target.reinsert_supported:
+                        reason = "No compatible modules found in the loaded model."
+                    else:
+                        reason = (
+                            "No reinsertion strategy for this operator family. "
+                            "Current verifier support is limited to matmul, conv2d, batchnorm, layout_transform, layernorm, rmsnorm, and softmax."
+                        )
+                    self._skipped_replacements.append(
+                        {
+                            "type": target.kernel_type,
+                            "rank": target.rank,
+                            "speedup": target.speedup,
+                            "path": target.optimized_path,
+                            "reason": reason,
+                        }
+                    )
 
         return self.model
 
@@ -612,7 +907,17 @@ class OptimizedModelContext:
         self._original_modules.clear()
         if "softmax" in self._original_functionals:
             F.softmax = self._original_functionals["softmax"]
+        if self._original_forward is not None:
+            self.model.forward = self._original_forward
+            self._original_forward = None
+        self._restore_model_contiguous = False
+        self._input_transform = None
         self._original_functionals.clear()
+
+    def prepare_input(self, model_input: Any) -> Any:
+        if self._input_transform is None:
+            return model_input
+        return self._input_transform(model_input)
 
     def _apply_replacement(self, repl: KernelReplacement) -> int:
         """
@@ -622,16 +927,264 @@ class OptimizedModelContext:
 
         if repl.kernel_type == "matmul":
             count = self._replace_linear_modules(repl)
+        elif repl.kernel_type == "conv2d":
+            count = self._replace_conv2d_modules(repl)
+        elif repl.kernel_type == "batchnorm":
+            count = self._replace_batchnorm_modules(repl)
         elif repl.kernel_type == "layernorm":
             count = self._replace_layernorm_modules(repl)
         elif repl.kernel_type == "rmsnorm":
             count = self._replace_rmsnorm_modules(repl)
         elif repl.kernel_type == "softmax":
             count = self._replace_softmax_functional(repl)
+        elif repl.kernel_type == "layout_transform":
+            count = self._replace_layout_transform_strategy(repl)
         else:
             print(f"  NOTE: No replacement strategy for kernel type '{repl.kernel_type}'. "
-                  f"Skipping. (Supported: matmul, layernorm, rmsnorm, softmax)")
+                  f"Skipping. (Supported: matmul, conv2d, batchnorm, layout_transform, layernorm, rmsnorm, softmax)")
 
+        return count
+
+    def _replace_layout_transform_strategy(self, repl: KernelReplacement) -> int:
+        if not repl.global_channels_last:
+            return 0
+
+        kernel_fn = repl.module_fn
+        self.model.to(memory_format=torch.channels_last)
+        self._restore_model_contiguous = True
+        input_cache: Dict[Tuple[int, Tuple[int, ...], Tuple[int, ...], torch.dtype, int], torch.Tensor] = {}
+
+        def to_channels_last_cached(value: torch.Tensor) -> torch.Tensor:
+            if not (value.ndim == 4 and value.is_cuda):
+                return value
+            key = (
+                int(value.data_ptr()),
+                tuple(int(dim) for dim in value.shape),
+                tuple(int(dim) for dim in value.stride()),
+                value.dtype,
+                int(value.device.index or 0),
+            )
+            cached = input_cache.get(key)
+            if cached is None:
+                cached = kernel_fn(value)
+                input_cache[key] = cached
+            return cached
+
+        def transform_model_input(model_input: Any) -> Any:
+            if isinstance(model_input, dict):
+                return {
+                    key: to_channels_last_cached(value) if isinstance(value, torch.Tensor) else value
+                    for key, value in model_input.items()
+                }
+            if isinstance(model_input, torch.Tensor):
+                return to_channels_last_cached(model_input)
+            return model_input
+
+        self._input_transform = transform_model_input
+        return 1
+
+    def _apply_group_replacement(
+        self,
+        kernel_type: str,
+        repls: List[KernelReplacement],
+    ) -> int:
+        if kernel_type == "conv2d":
+            return self._replace_conv2d_modules_with_dispatch(repls)
+        if kernel_type == "batchnorm":
+            return self._replace_batchnorm_modules_with_dispatch(repls)
+        return 0
+
+    def _build_conv_dispatch_fn(self, repls: List[KernelReplacement]) -> Callable:
+        specific_map: Dict[Tuple[int, ...], Callable] = {}
+        for repl in sorted((r for r in repls if r.model_shapes), key=lambda r: r.rank):
+            sig = _conv_signature_from_shape(repl.model_shapes)
+            if sig is not None and sig not in specific_map:
+                specific_map[sig] = repl.module_fn
+        fallback = next((r.module_fn for r in repls if r.generic_fallback), None)
+        if fallback is None and repls:
+            fallback = repls[0].module_fn
+
+        def dispatch(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+            bias: torch.Tensor | None = None,
+            stride: int | tuple[int, int] = 1,
+            padding: int | tuple[int, int] = 0,
+            dilation: int | tuple[int, int] = 1,
+            groups: int = 1,
+        ) -> torch.Tensor:
+            sig = _conv_signature_from_inputs(x, weight, stride, padding, dilation, groups)
+            matched = specific_map.get(sig) if sig is not None else None
+            if matched is not None:
+                return matched(
+                    x,
+                    weight,
+                    bias,
+                    stride=stride,
+                    padding=padding,
+                    dilation=dilation,
+                    groups=groups,
+                )
+            if fallback is not None:
+                return fallback(
+                    x,
+                    weight,
+                    bias,
+                    stride=stride,
+                    padding=padding,
+                    dilation=dilation,
+                    groups=groups,
+                )
+            return F.conv2d(
+                x,
+                weight,
+                bias,
+                stride=stride,
+                padding=padding,
+                dilation=dilation,
+                groups=groups,
+            )
+
+        return dispatch
+
+    def _build_batchnorm_dispatch_fn(self, repls: List[KernelReplacement]) -> Callable:
+        specific_map: Dict[Tuple[int, ...], Callable] = {}
+        for repl in sorted((r for r in repls if r.model_shapes), key=lambda r: r.rank):
+            sig = _batchnorm_signature_from_shape(repl.model_shapes)
+            if sig is not None and sig not in specific_map:
+                specific_map[sig] = repl.module_fn
+        fallback = next((r.module_fn for r in repls if r.generic_fallback), None)
+        if fallback is None and repls:
+            fallback = repls[0].module_fn
+
+        def dispatch(
+            x: torch.Tensor,
+            weight: torch.Tensor | None,
+            bias: torch.Tensor | None,
+            running_mean: torch.Tensor,
+            running_var: torch.Tensor,
+            eps: float = 1e-5,
+        ) -> torch.Tensor:
+            sig = _batchnorm_signature_from_input(x)
+            matched = specific_map.get(sig) if sig is not None else None
+            if matched is not None:
+                return matched(
+                    x,
+                    weight,
+                    bias,
+                    running_mean,
+                    running_var,
+                    eps=eps,
+                )
+            if fallback is not None:
+                return fallback(
+                    x,
+                    weight,
+                    bias,
+                    running_mean,
+                    running_var,
+                    eps=eps,
+                )
+            return F.batch_norm(
+                x,
+                running_mean,
+                running_var,
+                weight,
+                bias,
+                training=False,
+                eps=eps,
+            )
+
+        return dispatch
+
+    def _replace_conv2d_modules_with_dispatch(self, repls: List[KernelReplacement]) -> int:
+        dispatch_fn = self._build_conv_dispatch_fn(repls)
+        has_generic = any(r.generic_fallback for r in repls)
+        candidate_shapes = [r.model_shapes for r in repls if isinstance(r.model_shapes, dict)]
+        fusion_shapes = [
+            r.model_shapes
+            for r in repls
+            if r.fuse_batchnorm_act and isinstance(r.model_shapes, dict)
+        ]
+        count = 0
+        replaced_parent_names: set[str] = set()
+        for name, module in list(self.model.named_modules()):
+            if not isinstance(module, nn.Conv2d):
+                continue
+            parent_name = name.rsplit(".", 1)[0] if "." in name else ""
+            if parent_name in replaced_parent_names:
+                continue
+            if not has_generic and candidate_shapes:
+                if not any(_conv_module_may_match_shape(shape, module) for shape in candidate_shapes):
+                    continue
+
+            fused_parent = None
+            fused_norm = None
+            fused_act = None
+            if fusion_shapes and any(_conv_module_may_match_shape(shape, module) for shape in fusion_shapes):
+                parent_module, parent_attr = _get_named_parent(self.model, name)
+                if parent_module is not None and parent_attr:
+                    fused_parent = getattr(parent_module, parent_attr, None)
+                    fused_norm = (
+                        getattr(fused_parent, "bn", None)
+                        or getattr(fused_parent, "norm", None)
+                    )
+                    fused_act = getattr(fused_parent, "act", None)
+                    if not (
+                        hasattr(fused_parent, "conv")
+                        and getattr(fused_parent, "conv", None) is module
+                        and isinstance(fused_norm, nn.BatchNorm2d)
+                        and not getattr(fused_norm, "training", True)
+                        and isinstance(fused_act, nn.Module)
+                    ):
+                        fused_parent = None
+
+            if fused_parent is not None and parent_name:
+                grandparent, parent_attr = _get_named_parent(self.model, parent_name)
+                if grandparent is not None and parent_attr:
+                    self._original_modules[parent_name] = fused_parent
+                    setattr(
+                        grandparent,
+                        parent_attr,
+                        _ConvBnActFusedWrapper(
+                            fused_parent.conv,
+                            fused_norm,
+                            fused_act,
+                            dispatch_fn,
+                        ),
+                    )
+                    replaced_parent_names.add(parent_name)
+                    count += 1
+                    continue
+
+            self._original_modules[name] = module
+            wrapper = _Conv2dWrapper(module, dispatch_fn)
+            parent_module, attr = _get_named_parent(self.model, name)
+            if parent_module is None or attr is None:
+                continue
+            setattr(parent_module, attr, wrapper)
+            count += 1
+        return count
+
+    def _replace_batchnorm_modules_with_dispatch(self, repls: List[KernelReplacement]) -> int:
+        dispatch_fn = self._build_batchnorm_dispatch_fn(repls)
+        has_generic = any(r.generic_fallback for r in repls)
+        candidate_shapes = [r.model_shapes for r in repls if isinstance(r.model_shapes, dict)]
+        count = 0
+        for name, module in list(self.model.named_modules()):
+            if not isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                continue
+            if not has_generic and candidate_shapes:
+                if not any(_batchnorm_module_may_match_shape(shape, module) for shape in candidate_shapes):
+                    continue
+            self._original_modules[name] = module
+            wrapper = _BatchNormWrapper(module, dispatch_fn)
+            parts = name.split(".")
+            parent = self.model
+            for p in parts[:-1]:
+                parent = getattr(parent, p)
+            setattr(parent, parts[-1], wrapper)
+            count += 1
         return count
 
     def _replace_softmax_functional(self, repl: KernelReplacement) -> int:
@@ -671,6 +1224,36 @@ class OptimizedModelContext:
                 # Create wrapper
                 wrapper = _LinearWrapper(module, repl.module_fn)
                 # Install wrapper
+                parts = name.split(".")
+                parent = self.model
+                for p in parts[:-1]:
+                    parent = getattr(parent, p)
+                setattr(parent, parts[-1], wrapper)
+                count += 1
+        return count
+
+    def _replace_conv2d_modules(self, repl: KernelReplacement) -> int:
+        """Replace all nn.Conv2d modules with optimized wrappers."""
+        count = 0
+        for name, module in list(self.model.named_modules()):
+            if isinstance(module, nn.Conv2d):
+                self._original_modules[name] = module
+                wrapper = _Conv2dWrapper(module, repl.module_fn)
+                parts = name.split(".")
+                parent = self.model
+                for p in parts[:-1]:
+                    parent = getattr(parent, p)
+                setattr(parent, parts[-1], wrapper)
+                count += 1
+        return count
+
+    def _replace_batchnorm_modules(self, repl: KernelReplacement) -> int:
+        """Replace all BatchNorm modules with optimized wrappers."""
+        count = 0
+        for name, module in list(self.model.named_modules()):
+            if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                self._original_modules[name] = module
+                wrapper = _BatchNormWrapper(module, repl.module_fn)
                 parts = name.split(".")
                 parent = self.model
                 for p in parts[:-1]:
@@ -884,15 +1467,22 @@ def diagnose_kernel_failures(
 
         try:
             with ctx as patched_model:
+                opt_input = ctx.prepare_input(model_input)
                 with torch.no_grad():
-                    if isinstance(model_input, dict):
-                        opt_output = patched_model(**model_input)
+                    if isinstance(opt_input, dict):
+                        opt_output = patched_model(**opt_input)
                     else:
-                        opt_output = patched_model(model_input)
+                        opt_output = patched_model(opt_input)
                 torch.cuda.synchronize()
 
             opt_tensor = extract_tensor(opt_output)
-            comp = compare_outputs(ref_tensor, opt_tensor, dtype)
+            comp = compare_outputs(
+                ref_tensor,
+                opt_tensor,
+                dtype,
+                repl.verify_atol,
+                repl.verify_rtol,
+            )
 
             results.append({
                 "kernel_type": repl.kernel_type,
@@ -951,8 +1541,9 @@ def format_report(result: VerificationResult, diagnose_results: Optional[List] =
     if result.kernels_replaced:
         lines.append("Kernels replaced:")
         for k in result.kernels_replaced:
+            speedup_label = f"{k['speedup']:.1f}x" if k.get("speedup") is not None else "n/a"
             lines.append(f"  {k['type']} (rank {k['rank']}): "
-                         f"{k['speedup']:.1f}x -> {k['path']} "
+                         f"{speedup_label} -> {k['path']} "
                          f"({k['modules_replaced']} modules)")
     else:
         lines.append("Kernels replaced: none")
@@ -1180,11 +1771,14 @@ def main() -> None:
     print(f"  Found {len(replacements)} optimized kernel(s):")
     for r in replacements:
         reinsert_label = "YES" if r.reinsert_supported else "no"
+        speedup_label = f"{r.speedup:.1f}x" if r.speedup is not None else "n/a"
         print(
             f"    {r.kernel_type} (rank {r.rank}): "
-            f"speedup={r.speedup:.1f}x, reinsert={reinsert_label} -> {r.optimized_path}"
+            f"speedup={speedup_label}, reinsert={reinsert_label} -> {r.optimized_path}"
         )
     print()
+
+    reference_replacements, optimized_replacements = split_replacements_for_verification(replacements)
 
     # -----------------------------------------------------------------------
     # Step 2: Load model
@@ -1224,13 +1818,32 @@ def main() -> None:
     # -----------------------------------------------------------------------
     # Step 4: Reference run
     # -----------------------------------------------------------------------
-    print("Step 4: Reference run (original PyTorch ops)...")
+    if reference_replacements:
+        print("Step 4: Reference run (current accepted optimized stack)...")
+    else:
+        print("Step 4: Reference run (original PyTorch ops)...")
     try:
-        ref_output, ref_latency = benchmark_model(model, model_input, WARMUP_RUNS, TIMED_RUNS)
-        ref_tensor = extract_tensor(ref_output)
-        ref_shape_str = str(list(ref_tensor.shape))
-        print(f"  Output shape: {ref_shape_str}")
-        print(f"  Median latency: {ref_latency:.1f} ms")
+        if reference_replacements:
+            ref_ctx = OptimizedModelContext(model, reference_replacements)
+            with ref_ctx as baseline_model:
+                if ref_ctx.applied_summary:
+                    print("  Baseline replacements applied:")
+                    for line in ref_ctx.applied_summary:
+                        print(f"  {line}")
+                ref_input = ref_ctx.prepare_input(model_input)
+                ref_output, ref_latency = benchmark_model(
+                    baseline_model, ref_input, WARMUP_RUNS, TIMED_RUNS
+                )
+                ref_tensor = extract_tensor(ref_output)
+                ref_shape_str = str(list(ref_tensor.shape))
+                print(f"  Output shape: {ref_shape_str}")
+                print(f"  Median latency: {ref_latency:.1f} ms")
+        else:
+            ref_output, ref_latency = benchmark_model(model, model_input, WARMUP_RUNS, TIMED_RUNS)
+            ref_tensor = extract_tensor(ref_output)
+            ref_shape_str = str(list(ref_tensor.shape))
+            print(f"  Output shape: {ref_shape_str}")
+            print(f"  Median latency: {ref_latency:.1f} ms")
     except RuntimeError as e:
         if "out of memory" in str(e).lower():
             print(f"\nERROR: GPU out of memory during reference run.")
@@ -1249,9 +1862,10 @@ def main() -> None:
     # Step 5: Optimized run
     # -----------------------------------------------------------------------
     print("Step 5: Optimized run (with Triton kernel replacements)...")
-    ctx = OptimizedModelContext(model, replacements)
+    ctx = OptimizedModelContext(model, optimized_replacements)
     try:
         with ctx as patched_model:
+            opt_input = ctx.prepare_input(model_input)
             if ctx.applied_summary:
                 print("  Replacements applied:")
                 for line in ctx.applied_summary:
@@ -1266,7 +1880,7 @@ def main() -> None:
                     print(f"    {skipped['type']} (rank {skipped['rank']}): {skipped['reason']}")
 
             opt_output, opt_latency = benchmark_model(
-                patched_model, model_input, WARMUP_RUNS, TIMED_RUNS
+                patched_model, opt_input, WARMUP_RUNS, TIMED_RUNS
             )
             opt_tensor = extract_tensor(opt_output)
             opt_shape_str = str(list(opt_tensor.shape))
@@ -1292,7 +1906,18 @@ def main() -> None:
     # Step 6: Compare outputs
     # -----------------------------------------------------------------------
     print("Step 6: Comparing outputs...")
-    comp = compare_outputs(ref_tensor, opt_tensor, dtype, args.atol, args.rtol)
+    effective_atol = args.atol
+    effective_rtol = args.rtol
+    if effective_atol is None:
+        replacement_atols = [r.verify_atol for r in replacements if r.verify_atol is not None]
+        if replacement_atols:
+            effective_atol = max(replacement_atols)
+    if effective_rtol is None:
+        replacement_rtls = [r.verify_rtol for r in replacements if r.verify_rtol is not None]
+        if replacement_rtls:
+            effective_rtol = max(replacement_rtls)
+
+    comp = compare_outputs(ref_tensor, opt_tensor, dtype, effective_atol, effective_rtol)
     print(f"  correctness: {comp['correctness']}")
     print(f"  max_abs_error: {comp.get('max_abs_error', 0):.2e}")
     print(f"  mean_abs_error: {comp.get('mean_abs_error', 0):.2e}")
