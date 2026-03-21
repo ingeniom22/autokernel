@@ -166,7 +166,7 @@ def kernel_fn(
             eps,
             BLOCK_SIZE=block_size,
             ROWS_PER_PROGRAM=rows_per_program,
-            num_warps=2,
+            num_warps=1,
             num_stages=2,
         )
     else:
