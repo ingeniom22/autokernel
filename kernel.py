@@ -88,6 +88,45 @@ def layernorm_kernel(
     tl.store(row_start_y + col_offsets, y, mask=mask)
 
 
+@triton.jit
+def layernorm_small_kernel(
+    X_ptr,
+    Y_ptr,
+    W_ptr,
+    B_ptr,
+    stride_x_row,
+    stride_y_row,
+    M,
+    N,
+    eps,
+    BLOCK_SIZE: tl.constexpr,
+    ROWS_PER_PROGRAM: tl.constexpr,
+):
+    """Process several short rows per program to reduce launch overhead."""
+    pid = tl.program_id(0)
+
+    row_offsets = pid * ROWS_PER_PROGRAM + tl.arange(0, ROWS_PER_PROGRAM)
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    row_mask = row_offsets < M
+    col_mask = col_offsets < N
+    mask = row_mask[:, None] & col_mask[None, :]
+
+    x_ptrs = X_ptr + row_offsets[:, None] * stride_x_row + col_offsets[None, :]
+    x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+    mean = tl.sum(x, axis=1) / N
+    x_centered = tl.where(mask, x - mean[:, None], 0.0)
+    variance = tl.sum(x_centered * x_centered, axis=1) / N
+    inv_std = 1.0 / tl.sqrt(variance + eps)
+
+    w = tl.load(W_ptr + col_offsets, mask=col_mask, other=1.0).to(tl.float32)
+    b = tl.load(B_ptr + col_offsets, mask=col_mask, other=0.0).to(tl.float32)
+    y = x_centered * inv_std[:, None] * w[None, :] + b[None, :]
+
+    y_ptrs = Y_ptr + row_offsets[:, None] * stride_y_row + col_offsets[None, :]
+    tl.store(y_ptrs, y, mask=mask)
+
+
 def kernel_fn(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -113,17 +152,34 @@ def kernel_fn(
 
     y = torch.empty_like(x)
 
-    BLOCK_SIZE = triton.next_power_of_2(n_cols)
-
-    grid = (n_rows,)
-    layernorm_kernel[grid](
-        x, y,
-        weight, bias,
-        x.stride(0),
-        y.stride(0),
-        n_cols,
-        eps,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
+    if n_rows <= 128 and n_cols <= 128:
+        block_size = 128
+        rows_per_program = 8
+        grid = (triton.cdiv(n_rows, rows_per_program),)
+        layernorm_small_kernel[grid](
+            x, y,
+            weight, bias,
+            x.stride(0),
+            y.stride(0),
+            n_rows,
+            n_cols,
+            eps,
+            BLOCK_SIZE=block_size,
+            ROWS_PER_PROGRAM=rows_per_program,
+            num_warps=2,
+            num_stages=2,
+        )
+    else:
+        block_size = triton.next_power_of_2(n_cols)
+        grid = (n_rows,)
+        layernorm_kernel[grid](
+            x, y,
+            weight, bias,
+            x.stride(0),
+            y.stride(0),
+            n_cols,
+            eps,
+            BLOCK_SIZE=block_size,
+        )
 
     return y.view(orig_shape)
