@@ -573,6 +573,8 @@ class _ConvBnActFusedWrapper(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim == 4 and not x.is_contiguous(memory_format=torch.channels_last):
+            x = x.contiguous(memory_format=torch.channels_last)
         y = self.kernel_fn(
             x,
             self.folded_weight,
