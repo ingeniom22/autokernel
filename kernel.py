@@ -1,143 +1,87 @@
 """
 AutoKernel -- Extracted kernel from model profiling.
-Op type: layernorm
-Rank: 54 (0.4% of GPU time)
-Model shape: batch=40, dim=120
+Op type: softmax
+Rank: 70 (0.2% of GPU time)
+Model shape: rows=40, cols=18385
 
 This kernel was extracted from profiling models/ppocrv5_server.py.
 The agent optimizes this to maximize throughput at the model-specific shapes.
 """
 
-KERNEL_TYPE = "layernorm"
+KERNEL_TYPE = "softmax"
 
 # Model-specific shapes (the shapes that matter for THIS model)
-MODEL_SHAPES = {'batch': 40, 'dim': 120}
+MODEL_SHAPES = {'rows': 40, 'cols': 18385}
 
 # Benchmark config (self-describing -- bench.py can load this dynamically)
 TEST_SIZES = [
-    ("model_primary", {'batch': 40, 'dim': 120}),
+    ("model_primary", {'rows': 40, 'cols': 18385}),
     # Also test nearby sizes for robustness
-    ("model_half", {'batch': 20, 'dim': 60}),
-    ("model_double", {'batch': 80, 'dim': 240}),
+    ("model_half", {'rows': 20, 'cols': 9192}),
+    ("model_double", {'rows': 80, 'cols': 36770}),
 ]
 
 TOLERANCES = {'float16': {'atol': 0.001, 'rtol': 0.001}, 'bfloat16': {'atol': 0.002, 'rtol': 0.002}, 'float32': {'atol': 1e-05, 'rtol': 1e-05}}
 
 
 def FLOPS_FN(s):
-    return 8 * s["batch"] * s["dim"]
+    return 5 * s["rows"] * s["cols"]
 
 
 def BYTES_FN(s, dt_bytes):
-    return (2 * s["batch"] * s["dim"] + 2 * s["dim"]) * dt_bytes
+    return 2 * s["rows"] * s["cols"] * dt_bytes
 
 
 # ======================================================================
-# Triton kernel code (from kernels/layernorm.py)
+# Triton kernel code (from kernels/softmax.py)
 # ======================================================================
 
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 
 
 @triton.jit
-def layernorm_kernel(
-    X_ptr,
-    Y_ptr,
-    W_ptr,
-    B_ptr,
-    stride_x_row,
-    stride_y_row,
-    N,
-    eps,
+def softmax_kernel(
+    input_ptr,
+    output_ptr,
+    n_cols,
+    stride_input_row,
+    stride_output_row,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """Row-parallel layer normalization. One program per row."""
+    """Row-parallel online softmax. One program per row."""
     row_idx = tl.program_id(0)
 
-    row_start_x = X_ptr + row_idx * stride_x_row
-    row_start_y = Y_ptr + row_idx * stride_y_row
+    row_start_input = input_ptr + row_idx * stride_input_row
+    row_start_output = output_ptr + row_idx * stride_output_row
 
     col_offsets = tl.arange(0, BLOCK_SIZE)
-    mask = col_offsets < N
+    mask = col_offsets < n_cols
 
-    # Load row into float32 for numerical stability
-    x = tl.load(row_start_x + col_offsets, mask=mask, other=0.0).to(tl.float32)
+    # Load row
+    row = tl.load(row_start_input + col_offsets, mask=mask, other=float("-inf"))
 
-    # Pass 1: compute mean
-    mean = tl.sum(x, axis=0) / N
+    # Numerically stable softmax: subtract max
+    row_max = tl.max(row, axis=0)
+    row = row - row_max
 
-    # Pass 2: compute variance
-    x_centered = tl.where(mask, x - mean, 0.0)
-    variance = tl.sum(x_centered * x_centered, axis=0) / N
+    # Exponentiate
+    numerator = tl.exp(row)
 
-    # Normalize
-    inv_std = 1.0 / tl.sqrt(variance + eps)
-    x_norm = x_centered * inv_std
+    # Sum
+    denominator = tl.sum(numerator, axis=0)
 
-    # Load weight and bias
-    w = tl.load(W_ptr + col_offsets, mask=mask, other=1.0).to(tl.float32)
-    b = tl.load(B_ptr + col_offsets, mask=mask, other=0.0).to(tl.float32)
+    # Divide
+    result = numerator / denominator
 
-    # Apply affine transform
-    y = x_norm * w + b
-
-    # Store (cast back to input dtype via the store)
-    tl.store(row_start_y + col_offsets, y, mask=mask)
+    # Store
+    tl.store(row_start_output + col_offsets, result, mask=mask)
 
 
-@triton.jit
-def layernorm_small_kernel(
-    X_ptr,
-    Y_ptr,
-    W_ptr,
-    B_ptr,
-    stride_x_row,
-    stride_y_row,
-    M,
-    N,
-    eps,
-    BLOCK_SIZE: tl.constexpr,
-    ROWS_PER_PROGRAM: tl.constexpr,
-):
-    """Process several short rows per program to reduce launch overhead."""
-    pid = tl.program_id(0)
-
-    row_offsets = pid * ROWS_PER_PROGRAM + tl.arange(0, ROWS_PER_PROGRAM)
-    col_offsets = tl.arange(0, BLOCK_SIZE)
-    row_mask = row_offsets < M
-    col_mask = col_offsets < N
-    mask = row_mask[:, None] & col_mask[None, :]
-
-    x_ptrs = X_ptr + row_offsets[:, None] * stride_x_row + col_offsets[None, :]
-    x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
-
-    mean = tl.sum(x, axis=1) / N
-    x_centered = tl.where(mask, x - mean[:, None], 0.0)
-    variance = tl.sum(x_centered * x_centered, axis=1) / N
-    inv_std = 1.0 / tl.sqrt(variance + eps)
-
-    w = tl.load(W_ptr + col_offsets, mask=col_mask, other=1.0).to(tl.float32)
-    b = tl.load(B_ptr + col_offsets, mask=col_mask, other=0.0).to(tl.float32)
-    y = x_centered * inv_std[:, None] * w[None, :] + b[None, :]
-
-    y_ptrs = Y_ptr + row_offsets[:, None] * stride_y_row + col_offsets[None, :]
-    tl.store(y_ptrs, y, mask=mask)
-
-
-def kernel_fn(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor,
-    eps: float = 1e-5,
-) -> torch.Tensor:
-    """Entry point called by bench.py. Must match reference.layernorm_ref signature."""
+def kernel_fn(x: torch.Tensor) -> torch.Tensor:
+    """Entry point called by bench.py. Must match reference.softmax_ref signature."""
     assert x.is_cuda
-
-    if x.dtype == torch.bfloat16:
-        return F.layer_norm(x, x.shape[-1:], weight, bias, eps)
 
     # Flatten to 2D for row-parallel processing
     orig_shape = x.shape
@@ -147,39 +91,29 @@ def kernel_fn(
         x = x.view(-1, x.shape[-1])
 
     n_rows, n_cols = x.shape
-    assert weight.shape[0] == n_cols
-    assert bias.shape[0] == n_cols
+    output = torch.empty_like(x)
 
-    y = torch.empty_like(x)
-
-    if n_rows <= 128 and n_cols <= 128:
-        block_size = 128
-        rows_per_program = 8
-        grid = (triton.cdiv(n_rows, rows_per_program),)
-        layernorm_small_kernel[grid](
-            x, y,
-            weight, bias,
-            x.stride(0),
-            y.stride(0),
-            n_rows,
-            n_cols,
-            eps,
-            BLOCK_SIZE=block_size,
-            ROWS_PER_PROGRAM=rows_per_program,
-            num_warps=1,
-            num_stages=2,
-        )
+    # Block size must be a power of 2 >= n_cols
+    BLOCK_SIZE = triton.next_power_of_2(n_cols)
+    if n_cols >= 16384:
+        num_warps = 8
+        num_stages = 2
+    elif n_cols >= 4096:
+        num_warps = 4
+        num_stages = 2
     else:
-        block_size = triton.next_power_of_2(n_cols)
-        grid = (n_rows,)
-        layernorm_kernel[grid](
-            x, y,
-            weight, bias,
-            x.stride(0),
-            y.stride(0),
-            n_cols,
-            eps,
-            BLOCK_SIZE=block_size,
-        )
+        num_warps = 2
+        num_stages = 2
 
-    return y.view(orig_shape)
+    grid = (n_rows,)
+    softmax_kernel[grid](
+        x, output,
+        n_cols,
+        x.stride(0),
+        output.stride(0),
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+
+    return output.view(orig_shape)
