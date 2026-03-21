@@ -1,0 +1,8 @@
+experiment	tag	kernel_type	throughput_tflops	latency_us	pct_peak	speedup_vs_pytorch	correctness	peak_vram_mb	description
+1	failed	layernorm	0.9970				FAIL		starter layernorm failed bf16 shape-sweep tolerances despite fp16 speedup
+2	kept	layernorm	0.9940			1.000	PASS		establish correct layernorm baseline by routing bf16 to torch
+3	kept	layernorm	0.9870			1.000	PASS		multi-row short-row path improved the real ppocr 40x120 layernorm despite flat generic harness
+4	revert	layernorm	0.9870			1.000	PASS		larger rows-per-program regressed the real ppocr layernorm shape
+5	kept	layernorm	0.9930			1.000	PASS		one-warp short-row path further improved the real ppocr layernorm shape
+6	revert	layernorm	0.9910			1.000	PASS		one-stage short-row layernorm regressed the real ppocr shape
+7	kept	layernorm	0.9960			1.002	PASS		exact ppocr 40x120 layernorm fast path removed wrapper overhead and improved the real recognizer shape

@@ -30,6 +30,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
+from support import build_support_stage
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -45,6 +47,20 @@ _KERNEL_CLASSIFICATION: List[Tuple[List[str], str]] = [
     (["flash", "fmha"],                       "flash_attention"),
     (["attention"],                            "flash_attention"),
     (["gemm", "matmul", "cublas"],             "matmul"),
+    (["depthwise"],                            "depthwise_conv2d"),
+    (["conv_transpose", "deconv"],             "conv_transpose2d"),
+    (
+        [
+            "convolution",
+            "conv2d",
+            "cudnn_conv",
+            "miopen",
+            "implicit_convolve",
+            "winograd",
+            "scudnn",
+        ],
+        "conv2d",
+    ),
     (["softmax"],                              "softmax"),
     (["layer_norm", "layernorm"],              "layernorm"),
     (["rms_norm", "rmsnorm"],                  "rmsnorm"),
@@ -52,6 +68,9 @@ _KERNEL_CLASSIFICATION: List[Tuple[List[str], str]] = [
     (["cross_entropy", "nll"],                 "cross_entropy"),
     (["rotary", "rope"],                       "rotary_embedding"),
     (["reduce", "all_reduce"],                 "reduce"),
+    (["upsample", "interpolate"],              "interpolate"),
+    (["pool", "pooling"],                      "pooling"),
+    (["relu", "sigmoid", "hardswish", "swish", "pointwise", "elementwise"], "elementwise"),
 ]
 
 # Op types that have a matching kernels/*.py file in AutoKernel.
@@ -450,10 +469,26 @@ def classify_kernel(kernel_name: str) -> str:
     """Map a CUDA kernel name to an AutoKernel op type."""
     name_lower = kernel_name.lower()
 
+    if (
+        "addmm" in name_lower
+        or "matmul" in name_lower
+        or name_lower.startswith("aten::mm")
+        or "linear" in name_lower
+    ):
+        return "matmul"
+
     for fragments, op_type in _KERNEL_CLASSIFICATION:
         for frag in fragments:
             if frag in name_lower:
                 return op_type
+
+    if "concat" in name_lower:
+        return "concat"
+    if re.search(r"(?:^|[^a-z])cat(?:$|[^a-z])", name_lower):
+        return "concat"
+
+    if re.search(r"(?:^|[^a-z])(add|mul|sub|div)(?:$|[^a-z])", name_lower):
+        return "elementwise"
 
     # Check for standalone "mm" -- common in cuBLAS kernel names like
     # "void cutlass::...sgemm..." or names containing "_mm_" or ending in "mm".
@@ -511,6 +546,9 @@ class KernelRecord:
     input_shapes: str  # string representation of shapes
     roofline: str = ""
     supported: bool = False
+    profile_supported: bool = False
+    extract_supported: bool = False
+    reinsert_supported: bool = False
 
 
 def _run_forward(model: nn.Module, inputs: Dict[str, Any]) -> None:
@@ -673,8 +711,12 @@ def build_report(
 
     # Annotate records with roofline + supported
     for r in records:
+        support_stage = build_support_stage(r.op_type, _SUPPORTED_OP_TYPES)
         r.roofline = estimate_roofline_position(r.name, r.op_type, r.gpu_time_us, gpu)
-        r.supported = is_autokernel_supported(r.op_type)
+        r.profile_supported = support_stage["profile_supported"]
+        r.extract_supported = support_stage["extract_supported"]
+        r.reinsert_supported = support_stage["reinsert_supported"]
+        r.supported = r.extract_supported
 
     # Build top_kernels list
     top_kernels = []
@@ -693,13 +735,30 @@ def build_report(
             "pct_total": round(pct, 1),
             "cumulative_pct": round(cumulative_pct, 1),
             "roofline": r.roofline,
-            "autokernel_supported": r.supported,
+            "autokernel_supported": r.extract_supported,
+            "profile_supported": r.profile_supported,
+            "reinsert_supported": r.reinsert_supported,
+            "support_stage": {
+                "profile_supported": r.profile_supported,
+                "extract_supported": r.extract_supported,
+                "reinsert_supported": r.reinsert_supported,
+            },
             "optimization_priority": _priority_label(pct),
         })
 
     # Optimization summary
-    supported_time_us = sum(r.gpu_time_us for r in records if r.supported)
-    supported_pct = (supported_time_us / total_gpu_time_us * 100.0) if total_gpu_time_us > 0 else 0.0
+    profile_supported_time_us = sum(r.gpu_time_us for r in records if r.profile_supported)
+    extract_supported_time_us = sum(r.gpu_time_us for r in records if r.extract_supported)
+    reinsert_supported_time_us = sum(r.gpu_time_us for r in records if r.reinsert_supported)
+    profile_supported_pct = (
+        profile_supported_time_us / total_gpu_time_us * 100.0 if total_gpu_time_us > 0 else 0.0
+    )
+    extract_supported_pct = (
+        extract_supported_time_us / total_gpu_time_us * 100.0 if total_gpu_time_us > 0 else 0.0
+    )
+    reinsert_supported_pct = (
+        reinsert_supported_time_us / total_gpu_time_us * 100.0 if total_gpu_time_us > 0 else 0.0
+    )
 
     top5_time_us = sum(r.gpu_time_us for r in records[:5])
     top5_pct = (top5_time_us / total_gpu_time_us * 100.0) if total_gpu_time_us > 0 else 0.0
@@ -707,7 +766,7 @@ def build_report(
     # Estimated max speedup via Amdahl's law:
     # If supported kernels can be made ~3x faster on average:
     # S = 1 / ((1 - f) + f/s) where f = supported fraction, s = per-kernel speedup
-    f = supported_pct / 100.0
+    f = extract_supported_pct / 100.0
     s = 3.0  # assume each supported kernel can be made 3x faster on average
     if f > 0:
         amdahl_speedup = 1.0 / ((1.0 - f) + f / s)
@@ -729,7 +788,10 @@ def build_report(
         "profile_iters": PROFILE_ITERS,
         "top_kernels": top_kernels,
         "optimization_summary": {
-            "supported_kernels_pct": round(supported_pct, 1),
+            "profile_supported_kernels_pct": round(profile_supported_pct, 1),
+            "extract_supported_kernels_pct": round(extract_supported_pct, 1),
+            "reinsert_supported_kernels_pct": round(reinsert_supported_pct, 1),
+            "supported_kernels_pct": round(extract_supported_pct, 1),
             "top5_pct": round(top5_pct, 1),
             "estimated_max_speedup": (
                 f"{amdahl_speedup:.1f}x "
@@ -768,7 +830,7 @@ def print_report(
     print("=" * 60)
     header = (
         f"{'Rank':>4} | {'Op Type':<20} | {'GPU Time (ms)':>13} | "
-        f"{'Calls':>5} | {'Pct':>6} | {'Cumul':>6} | Supported"
+        f"{'Calls':>5} | {'Pct':>6} | {'Cumul':>6} | {'Extract':>7} | {'Reinsert':>9}"
     )
     print(header)
     print("-" * len(header))
@@ -776,14 +838,16 @@ def print_report(
     display_count = min(len(records), 20)
     for i in range(display_count):
         k = report["top_kernels"][i]
-        sup_label = "YES" if k["autokernel_supported"] else "no"
+        extract_label = "YES" if k["autokernel_supported"] else "no"
+        reinsert_label = "YES" if k["reinsert_supported"] else "no"
         print(
             f"{k['rank']:>4} | {k['op_type']:<20} | "
             f"{k['gpu_time_ms']:>13.3f} | "
             f"{k['call_count']:>5} | "
             f"{k['pct_total']:>5.1f}% | "
             f"{k['cumulative_pct']:>5.1f}% | "
-            f"{sup_label}"
+            f"{extract_label:>7} | "
+            f"{reinsert_label:>9}"
         )
 
     remaining = len(records) - display_count
@@ -803,14 +867,22 @@ def print_report(
 
     supported_types = set()
     for r in records:
-        if r.supported:
+        if r.extract_supported:
             supported_types.add(r.op_type)
 
     type_count = len(supported_types)
     type_word = "type" if type_count == 1 else "types"
     print(
-        f"  AutoKernel can optimize {summary['supported_kernels_pct']:.1f}% of GPU time "
+        f"  AutoKernel can classify {summary['profile_supported_kernels_pct']:.1f}% of GPU time "
+        f"into known operator families."
+    )
+    print(
+        f"  AutoKernel can extract/bench {summary['extract_supported_kernels_pct']:.1f}% of GPU time "
         f"({type_count} kernel {type_word})."
+    )
+    print(
+        f"  AutoKernel can reinsert {summary['reinsert_supported_kernels_pct']:.1f}% of GPU time "
+        f"with the current verifier patch strategies."
     )
     print(
         f"  Top-5 kernels account for {summary['top5_pct']:.1f}% of total GPU time."

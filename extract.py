@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
 import re
@@ -191,7 +192,7 @@ def parse_shape_info(shape_info_str: str, op_type: str) -> Optional[Dict[str, in
     # Match key=value pairs
     pairs = re.findall(r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(\d+)", shape_info_str)
     if not pairs:
-        return None
+        return _parse_profiler_shape_list(shape_info_str, op_type)
 
     raw = {k: int(v) for k, v in pairs}
 
@@ -203,8 +204,85 @@ def parse_shape_info(shape_info_str: str, op_type: str) -> Optional[Dict[str, in
             mapped_key = alias_map.get(k, k)
             canonical[mapped_key] = v
         return canonical
-    else:
-        return raw
+    return raw
+
+
+def _product(values: List[int]) -> int:
+    result = 1
+    for value in values:
+        result *= value
+    return result
+
+
+def _as_shape_list(value: Any) -> Optional[List[List[int]]]:
+    if not isinstance(value, (list, tuple)):
+        return None
+    shapes: List[List[int]] = []
+    for entry in value:
+        if isinstance(entry, (list, tuple)) and all(isinstance(dim, int) for dim in entry):
+            shapes.append([int(dim) for dim in entry])
+        else:
+            shapes.append([])
+    return shapes
+
+
+def _parse_profiler_shape_list(shape_info_str: str, op_type: str) -> Optional[Dict[str, int]]:
+    try:
+        parsed = ast.literal_eval(shape_info_str)
+    except (SyntaxError, ValueError):
+        return None
+
+    shapes = _as_shape_list(parsed)
+    if shapes is None:
+        return None
+
+    if op_type == "matmul":
+        if len(shapes) >= 2 and len(shapes[0]) == 2 and len(shapes[1]) == 2:
+            m, k = shapes[0]
+            k2, n = shapes[1]
+            if k == k2:
+                return {"M": m, "N": n, "K": k}
+        if len(shapes) >= 3 and len(shapes[1]) == 2 and len(shapes[2]) == 2:
+            m, k = shapes[1]
+            k2, n = shapes[2]
+            if k == k2:
+                return {"M": m, "N": n, "K": k}
+        return None
+
+    if op_type in {"layernorm", "rmsnorm", "reduce"}:
+        if shapes and len(shapes[0]) >= 1:
+            input_shape = shapes[0]
+            dim = input_shape[-1]
+            batch = _product(input_shape[:-1]) if len(input_shape) > 1 else 1
+            keys = SHAPE_ALIAS_MAP.get(op_type, {})
+            if op_type == "layernorm":
+                return {keys["batch"]: batch, keys["dim"]: dim}
+            return {"M": batch, "N": dim}
+        return None
+
+    if op_type == "softmax":
+        if shapes and len(shapes[0]) >= 2:
+            input_shape = shapes[0]
+            return {
+                "rows": _product(input_shape[:-1]),
+                "cols": input_shape[-1],
+            }
+        return None
+
+    return None
+
+
+def _has_parseable_shape(kernel: Dict[str, Any]) -> bool:
+    shape_info_str = kernel.get("shape_info", kernel.get("shape", ""))
+    op_type = kernel.get("op_type", "")
+    if isinstance(kernel.get("shapes"), dict):
+        return True
+    return parse_shape_info(shape_info_str, op_type) is not None
+
+
+def _is_operator_level_candidate(kernel: Dict[str, Any]) -> bool:
+    name = str(kernel.get("name", ""))
+    return name.startswith("aten::")
 
 
 def shape_to_display(shape: Dict[str, int]) -> str:
@@ -402,7 +480,11 @@ def load_profile_report(path: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def get_supported_kernels(report: Dict[str, Any]) -> List[Dict[str, Any]]:
+def get_supported_kernels(
+    report: Dict[str, Any],
+    prefer_operator_level: bool = False,
+    require_shape: bool = False,
+) -> List[Dict[str, Any]]:
     """
     Extract the list of supported (autokernel_supported=True) kernels from
     the profile report, sorted by rank.
@@ -412,6 +494,18 @@ def get_supported_kernels(report: Dict[str, Any]) -> List[Dict[str, Any]]:
     for k in kernels:
         if k.get("autokernel_supported", False):
             supported.append(k)
+
+    if prefer_operator_level:
+        operator_level = [k for k in supported if _is_operator_level_candidate(k)]
+        if require_shape:
+            operator_level = [k for k in operator_level if _has_parseable_shape(k)]
+        if operator_level:
+            supported = operator_level
+
+    if require_shape and not prefer_operator_level:
+        shape_filtered = [k for k in supported if _has_parseable_shape(k)]
+        if shape_filtered:
+            supported = shape_filtered
 
     # Sort by rank if available, otherwise by gpu_time_ms descending
     supported.sort(key=lambda x: x.get("rank", x.get("gpu_time_ms", 0)))
@@ -464,6 +558,8 @@ def extract_kernels(
     top_n: Optional[int] = None,
     kernel_type_filter: Optional[str] = None,
     backend: str = "triton",
+    prefer_operator_level: bool = False,
+    require_shape: bool = False,
 ) -> None:
     """Main extraction pipeline."""
 
@@ -483,7 +579,11 @@ def extract_kernels(
     model_name = report.get("model_name", report.get("model", "unknown model"))
 
     # -- Get supported kernels --
-    supported = get_supported_kernels(report)
+    supported = get_supported_kernels(
+        report,
+        prefer_operator_level=prefer_operator_level,
+        require_shape=require_shape,
+    )
     if not supported:
         print("ERROR: No supported kernels found in profile report.")
         print("       Ensure the profiler marks kernels with autokernel_supported=True.")
@@ -633,6 +733,16 @@ def main() -> None:
         default="triton",
         help="Backend for starter kernels: 'triton' (default) or 'cuda' (native CUDA C++)",
     )
+    parser.add_argument(
+        "--prefer-operator-level",
+        action="store_true",
+        help="Prefer shape-resolved framework ops (for example aten::mm) over anonymous backend kernels.",
+    )
+    parser.add_argument(
+        "--require-shape",
+        action="store_true",
+        help="Prefer kernels whose shape metadata can be parsed from the profile report.",
+    )
 
     args = parser.parse_args()
 
@@ -641,6 +751,8 @@ def main() -> None:
         top_n=args.top,
         kernel_type_filter=args.kernel_type,
         backend=args.backend,
+        prefer_operator_level=args.prefer_operator_level,
+        require_shape=args.require_shape,
     )
 
 

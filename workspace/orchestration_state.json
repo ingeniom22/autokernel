@@ -1,0 +1,82 @@
+{
+  "current_kernel_idx": 4,
+  "current_kernel_file": "workspace/kernel_matmul_89.py",
+  "started_at": "2026-03-21T04:10:43",
+  "kernels": [
+    {
+      "rank": 34,
+      "file": "workspace/kernel_matmul_34.py",
+      "op_type": "matmul",
+      "pct_total": 0.7,
+      "status": "done",
+      "baseline_tflops": 0.177,
+      "best_tflops": 0.177,
+      "speedup": 1.0,
+      "pct_peak": null,
+      "experiments_run": 4,
+      "experiments_kept": 1,
+      "consecutive_reverts": 1,
+      "time_spent_minutes": 7
+    },
+    {
+      "rank": 54,
+      "file": "workspace/kernel_layernorm_54.py",
+      "op_type": "layernorm",
+      "pct_total": 0.4,
+      "status": "done",
+      "baseline_tflops": 0.994,
+      "best_tflops": 0.996,
+      "speedup": 1.002,
+      "pct_peak": null,
+      "experiments_run": 7,
+      "experiments_kept": 4,
+      "consecutive_reverts": 0,
+      "time_spent_minutes": 43
+    },
+    {
+      "rank": 70,
+      "file": "workspace/kernel_softmax_70.py",
+      "op_type": "softmax",
+      "pct_total": 0.2,
+      "status": "done",
+      "baseline_tflops": 0.641,
+      "best_tflops": 0.645,
+      "speedup": 1.006,
+      "pct_peak": null,
+      "experiments_run": 7,
+      "experiments_kept": 6,
+      "consecutive_reverts": 0,
+      "time_spent_minutes": 44
+    },
+    {
+      "rank": 88,
+      "file": "workspace/kernel_matmul_88.py",
+      "op_type": "matmul",
+      "pct_total": 0.2,
+      "status": "done",
+      "baseline_tflops": 0.176,
+      "best_tflops": 0.176,
+      "speedup": 1.0,
+      "pct_peak": null,
+      "experiments_run": 2,
+      "experiments_kept": 1,
+      "consecutive_reverts": 0,
+      "time_spent_minutes": 29
+    },
+    {
+      "rank": 89,
+      "file": "workspace/kernel_matmul_89.py",
+      "op_type": "matmul",
+      "pct_total": 0.2,
+      "status": "done",
+      "baseline_tflops": 0.176,
+      "best_tflops": 0.176,
+      "speedup": 1.0,
+      "pct_peak": null,
+      "experiments_run": 2,
+      "experiments_kept": 1,
+      "consecutive_reverts": 0,
+      "time_spent_minutes": 33
+    }
+  ]
+}

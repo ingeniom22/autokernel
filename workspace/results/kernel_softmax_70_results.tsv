@@ -1,0 +1,8 @@
+experiment	tag	kernel_type	throughput_tflops	latency_us	pct_peak	speedup_vs_pytorch	correctness	peak_vram_mb	description
+1	kept	softmax	0.6410			1.000	PASS		establish correct softmax baseline; generic bench is strong but ppocr shape still trails torch
+2	kept	softmax	0.6450			1.006	PASS		explicit long-row softmax launch improved the real ppocr logits shape
+3	kept	softmax	0.6440			1.006	PASS		one-stage long-row softmax launch further improved the real ppocr logits shape
+4	revert	softmax	0.6420			1.006	PASS		four-warp long-row softmax regressed the real ppocr logits shape
+5	kept	softmax	0.6420			1.006	PASS		tiled long-row softmax cut ppocr logits latency sharply while keeping generic throughput near baseline
+6	kept	softmax	0.6400			1.006	PASS		tuned tiled long-row softmax improved ppocr logits shape and preserved the generic harness
+7	kept	softmax	0.6440			1.006	PASS		exact ppocr softmax fast paths for 2d and 3d logits removed wrapper overhead on the real recognizer shape

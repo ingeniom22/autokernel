@@ -35,6 +35,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from support import build_support_stage
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -67,6 +69,7 @@ class KernelReplacement:
     speedup: float            # individual kernel speedup
     optimized_path: str       # path to optimized kernel .py file
     module_fn: Optional[Callable] = None  # loaded kernel function
+    reinsert_supported: bool = False
 
 
 @dataclass
@@ -85,6 +88,7 @@ class VerificationResult:
     opt_output_shape: str = ""
     opt_latency_ms: float = 0.0
     kernels_replaced: List[Dict[str, Any]] = field(default_factory=list)
+    kernels_skipped: List[Dict[str, Any]] = field(default_factory=list)
 
     # Comparison
     correctness: str = "UNKNOWN"
@@ -352,11 +356,13 @@ def discover_optimized_kernels() -> List[KernelReplacement]:
                     )
 
             if os.path.exists(opt_path) and speedup > 1.0:
+                support_stage = build_support_stage(ktype, {ktype})
                 replacements.append(KernelReplacement(
                     kernel_type=ktype,
                     rank=rank,
                     speedup=speedup,
                     optimized_path=opt_path,
+                    reinsert_supported=support_stage["reinsert_supported"],
                 ))
         return replacements
 
@@ -383,11 +389,13 @@ def discover_optimized_kernels() -> List[KernelReplacement]:
                 # Everything between parts[1] and the rank index is the type
                 ktype = "_".join(parts[1:rank_idx]) if rank_idx > 1 else parts[1]
                 opt_path = os.path.join(WORKSPACE_DIR, fname)
+                support_stage = build_support_stage(ktype, {ktype})
                 replacements.append(KernelReplacement(
                     kernel_type=ktype,
                     rank=rank,
                     speedup=0.0,  # Unknown without state file
                     optimized_path=opt_path,
+                    reinsert_supported=support_stage["reinsert_supported"],
                 ))
 
     return replacements
@@ -520,18 +528,42 @@ class OptimizedModelContext:
         self.model = model
         self.replacements = replacements
         self._original_modules: Dict[str, nn.Module] = {}
+        self._original_functionals: Dict[str, Any] = {}
         self._applied: List[str] = []
+        self._applied_replacements: List[Dict[str, Any]] = []
+        self._skipped_replacements: List[Dict[str, Any]] = []
 
     def __enter__(self) -> nn.Module:
+        self._applied.clear()
+        self._applied_replacements.clear()
+        self._skipped_replacements.clear()
         for repl in self.replacements:
             try:
                 kernel_mod = load_kernel_module(repl.optimized_path)
                 if not hasattr(kernel_mod, "kernel_fn"):
                     print(f"  WARNING: {repl.optimized_path} has no kernel_fn, skipping")
+                    self._skipped_replacements.append(
+                        {
+                            "type": repl.kernel_type,
+                            "rank": repl.rank,
+                            "speedup": repl.speedup,
+                            "path": repl.optimized_path,
+                            "reason": "Optimized kernel file has no kernel_fn.",
+                        }
+                    )
                     continue
                 repl.module_fn = kernel_mod.kernel_fn
             except Exception as e:
                 print(f"  WARNING: Failed to load {repl.optimized_path}: {e}")
+                self._skipped_replacements.append(
+                    {
+                        "type": repl.kernel_type,
+                        "rank": repl.rank,
+                        "speedup": repl.speedup,
+                        "path": repl.optimized_path,
+                        "reason": f"Failed to load optimized kernel: {e}",
+                    }
+                )
                 continue
 
             replaced = self._apply_replacement(repl)
@@ -539,6 +571,32 @@ class OptimizedModelContext:
                 self._applied.append(
                     f"  {repl.kernel_type} (rank {repl.rank}): "
                     f"{repl.speedup:.1f}x -> {repl.optimized_path}"
+                )
+                self._applied_replacements.append(
+                    {
+                        "type": repl.kernel_type,
+                        "rank": repl.rank,
+                        "speedup": repl.speedup,
+                        "path": repl.optimized_path,
+                        "modules_replaced": replaced,
+                    }
+                )
+            else:
+                if repl.reinsert_supported:
+                    reason = "No compatible modules found in the loaded model."
+                else:
+                    reason = (
+                        "No reinsertion strategy for this operator family. "
+                        "Current verifier support is limited to matmul, layernorm, rmsnorm, and softmax."
+                    )
+                self._skipped_replacements.append(
+                    {
+                        "type": repl.kernel_type,
+                        "rank": repl.rank,
+                        "speedup": repl.speedup,
+                        "path": repl.optimized_path,
+                        "reason": reason,
+                    }
                 )
 
         return self.model
@@ -552,7 +610,9 @@ class OptimizedModelContext:
                 parent = getattr(parent, p)
             setattr(parent, parts[-1], original)
         self._original_modules.clear()
-        self._applied.clear()
+        if "softmax" in self._original_functionals:
+            F.softmax = self._original_functionals["softmax"]
+        self._original_functionals.clear()
 
     def _apply_replacement(self, repl: KernelReplacement) -> int:
         """
@@ -566,11 +626,40 @@ class OptimizedModelContext:
             count = self._replace_layernorm_modules(repl)
         elif repl.kernel_type == "rmsnorm":
             count = self._replace_rmsnorm_modules(repl)
+        elif repl.kernel_type == "softmax":
+            count = self._replace_softmax_functional(repl)
         else:
             print(f"  NOTE: No replacement strategy for kernel type '{repl.kernel_type}'. "
-                  f"Skipping. (Supported: matmul, layernorm, rmsnorm)")
+                  f"Skipping. (Supported: matmul, layernorm, rmsnorm, softmax)")
 
         return count
+
+    def _replace_softmax_functional(self, repl: KernelReplacement) -> int:
+        """Monkeypatch F.softmax for the exact PP-OCR recognizer logits shape."""
+        if "softmax" not in self._original_functionals:
+            self._original_functionals["softmax"] = F.softmax
+
+        original_softmax = self._original_functionals["softmax"]
+        kernel_fn = repl.module_fn
+
+        def patched_softmax(
+            input: torch.Tensor,
+            dim: Optional[int] = None,
+            _stacklevel: int = 3,
+            dtype: Optional[torch.dtype] = None,
+        ) -> torch.Tensor:
+            if (
+                isinstance(input, torch.Tensor)
+                and input.is_cuda
+                and dtype is None
+                and dim in (-1, input.dim() - 1)
+                and tuple(input.shape) in {(40, 18385), (1, 40, 18385)}
+            ):
+                return kernel_fn(input)
+            return original_softmax(input, dim=dim, _stacklevel=_stacklevel, dtype=dtype)
+
+        F.softmax = patched_softmax
+        return 1
 
     def _replace_linear_modules(self, repl: KernelReplacement) -> int:
         """Replace all nn.Linear modules with optimized matmul wrapper."""
@@ -639,6 +728,14 @@ class OptimizedModelContext:
     @property
     def applied_summary(self) -> List[str]:
         return self._applied
+
+    @property
+    def applied_replacements(self) -> List[Dict[str, Any]]:
+        return list(self._applied_replacements)
+
+    @property
+    def skipped_replacements(self) -> List[Dict[str, Any]]:
+        return list(self._skipped_replacements)
 
 
 # ---------------------------------------------------------------------------
@@ -855,9 +952,14 @@ def format_report(result: VerificationResult, diagnose_results: Optional[List] =
         lines.append("Kernels replaced:")
         for k in result.kernels_replaced:
             lines.append(f"  {k['type']} (rank {k['rank']}): "
-                         f"{k['speedup']:.1f}x -> {k['path']}")
+                         f"{k['speedup']:.1f}x -> {k['path']} "
+                         f"({k['modules_replaced']} modules)")
     else:
         lines.append("Kernels replaced: none")
+    if result.kernels_skipped:
+        lines.append("Kernels skipped:")
+        for k in result.kernels_skipped:
+            lines.append(f"  {k['type']} (rank {k['rank']}): {k['reason']}")
     lines.append(f"Output shape: {result.opt_output_shape}")
     lines.append(f"Latency: {result.opt_latency_ms:.1f} ms ({TIMED_RUNS} runs, median)")
 
@@ -879,6 +981,7 @@ def format_report(result: VerificationResult, diagnose_results: Optional[List] =
     lines.append(f"optimized_latency_ms: {result.opt_latency_ms:.1f}")
     lines.append(f"end_to_end_speedup: {result.end_to_end_speedup:.2f}x")
     lines.append(f"kernels_replaced: {len(result.kernels_replaced)}")
+    lines.append(f"kernels_skipped: {len(result.kernels_skipped)}")
 
     # Diagnosis
     if diagnose_results:
@@ -912,6 +1015,7 @@ def save_verification_json(result: VerificationResult, path: str) -> None:
             "output_shape": result.opt_output_shape,
             "latency_ms": round(result.opt_latency_ms, 2),
             "kernels_replaced": result.kernels_replaced,
+            "kernels_skipped": result.kernels_skipped,
         },
         "verification": {
             "correctness": result.correctness,
@@ -925,6 +1029,7 @@ def save_verification_json(result: VerificationResult, path: str) -> None:
             "optimized_latency_ms": round(result.opt_latency_ms, 2),
             "end_to_end_speedup": round(result.end_to_end_speedup, 3),
             "kernels_replaced": len(result.kernels_replaced),
+            "kernels_skipped": len(result.kernels_skipped),
         },
     }
 
@@ -1074,7 +1179,11 @@ def main() -> None:
 
     print(f"  Found {len(replacements)} optimized kernel(s):")
     for r in replacements:
-        print(f"    {r.kernel_type} (rank {r.rank}): speedup={r.speedup:.1f}x -> {r.optimized_path}")
+        reinsert_label = "YES" if r.reinsert_supported else "no"
+        print(
+            f"    {r.kernel_type} (rank {r.rank}): "
+            f"speedup={r.speedup:.1f}x, reinsert={reinsert_label} -> {r.optimized_path}"
+        )
     print()
 
     # -----------------------------------------------------------------------
@@ -1149,7 +1258,12 @@ def main() -> None:
                     print(f"  {line}")
             else:
                 print("  WARNING: No kernel replacements could be applied to this model.")
-                print("  The model may not contain modules matching the optimized kernel types.")
+                print("  The model may not contain compatible modules, or the operator family")
+                print("  may not have a reinsertion strategy in verify.py yet.")
+            if ctx.skipped_replacements:
+                print("  Replacements skipped:")
+                for skipped in ctx.skipped_replacements:
+                    print(f"    {skipped['type']} (rank {skipped['rank']}): {skipped['reason']}")
 
             opt_output, opt_latency = benchmark_model(
                 patched_model, model_input, WARMUP_RUNS, TIMED_RUNS
@@ -1211,16 +1325,8 @@ def main() -> None:
         ref_latency_ms=ref_latency,
         opt_output_shape=opt_shape_str,
         opt_latency_ms=opt_latency,
-        kernels_replaced=[
-            {
-                "type": r.kernel_type,
-                "rank": r.rank,
-                "speedup": r.speedup,
-                "path": r.optimized_path,
-            }
-            for r in replacements
-            if r.module_fn is not None
-        ],
+        kernels_replaced=[dict(entry) for entry in ctx.applied_replacements],
+        kernels_skipped=[dict(entry) for entry in ctx.skipped_replacements],
         correctness=comp["correctness"],
         max_abs_error=comp.get("max_abs_error", 0.0),
         mean_abs_error=comp.get("mean_abs_error", 0.0),
