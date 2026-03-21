@@ -96,7 +96,14 @@ def kernel_fn(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     K2, N = B.shape
     assert K == K2
 
+    is_model_shape = (
+        M == MODEL_SHAPES["M"]
+        and N == MODEL_SHAPES["N"]
+        and K == MODEL_SHAPES["K"]
+    )
     if A.dtype == torch.float32 or K > 4096:
+        return torch.matmul(A, B)
+    if not is_model_shape and ((M % 32) or (N % 32) or (K % 32)):
         return torch.matmul(A, B)
 
     C = torch.empty((M, N), device=A.device, dtype=A.dtype)
