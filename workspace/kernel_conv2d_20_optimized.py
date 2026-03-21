@@ -39,16 +39,6 @@ def BYTES_FN(s, dt_bytes):
 import torch
 import torch.nn.functional as F
 
-FUSE_BATCHNORM_ACT = True
-
-
-def _pair(value: int | tuple[int, int] | list[int]) -> tuple[int, int]:
-    if isinstance(value, tuple):
-        return int(value[0]), int(value[1])
-    if isinstance(value, list):
-        return int(value[0]), int(value[1])
-    return int(value), int(value)
-
 
 def kernel_fn(
     x: torch.Tensor,
@@ -60,30 +50,6 @@ def kernel_fn(
     groups: int = 1,
 ) -> torch.Tensor:
     """Entry point called by bench.py. Matches torch.nn.functional.conv2d."""
-    stride_hw = _pair(stride)
-    padding_hw = _pair(padding)
-    dilation_hw = _pair(dilation)
-    if (
-        x.is_cuda
-        and x.dtype == torch.float16
-        and x.ndim == 4
-        and weight.ndim == 4
-        and groups == int(x.shape[1]) == int(weight.shape[0])
-        and int(weight.shape[1]) == 1
-        and tuple(int(dim) for dim in weight.shape[2:]) == (5, 5)
-        and stride_hw == (1, 1)
-        and padding_hw == (2, 2)
-        and dilation_hw == (1, 1)
-    ):
-        return torch._C._nn._conv_depthwise2d(
-            x,
-            weight,
-            [5, 5],
-            bias,
-            [1, 1],
-            [2, 2],
-            [1, 1],
-        )
     return F.conv2d(
         x,
         weight,
