@@ -167,7 +167,7 @@ def kernel_fn(
             BLOCK_SIZE=block_size,
             ROWS_PER_PROGRAM=rows_per_program,
             num_warps=1,
-            num_stages=2,
+            num_stages=1,
         )
     else:
         block_size = triton.next_power_of_2(n_cols)
