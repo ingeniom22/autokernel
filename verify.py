@@ -545,6 +545,7 @@ class _ConvBnActFusedWrapper(nn.Module):
         self.dilation = conv.dilation
         self.groups = conv.groups
         self.act = act
+        self._use_inplace_relu = isinstance(act, nn.ReLU)
 
         with torch.no_grad():
             weight_fp32 = conv.weight.detach().float()
@@ -584,6 +585,8 @@ class _ConvBnActFusedWrapper(nn.Module):
             dilation=self.dilation,
             groups=self.groups,
         )
+        if self._use_inplace_relu:
+            return torch.relu_(y)
         return self.act(y)
 
 
