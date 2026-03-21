@@ -110,11 +110,11 @@ def kernel_fn(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
 
     if M <= 64 and K <= 256 and N >= 4096:
         block_size_m = 32
-        block_size_n = 256
+        block_size_n = 128
         block_size_k = 32
-        group_size_m = 2
-        num_warps = 2
-        num_stages = 2
+        group_size_m = 4
+        num_warps = 4
+        num_stages = 3
     else:
         block_size_m = 128
         block_size_n = 128
