@@ -1,0 +1,4 @@
+experiment	tag	kernel_type	throughput_tflops	latency_us	pct_peak	speedup_vs_pytorch	correctness	peak_vram_mb	description
+1	kept	conv2d		14050.0		1.000	PASS		baseline recognizer stack before rank-10 conv candidate
+2	revert	conv2d		14420.0		1.000	PASS		cached channels-last weights improve the microbench but regress full recognizer latency
+3	revert	conv2d		14600.0		1.000	PASS		rank-10 conv-bn fusion across 15 ConvBNAct blocks is exact but materially slows the recognizer on top of layout_transform_1

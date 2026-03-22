@@ -1,0 +1,4 @@
+experiment	tag	kernel_type	throughput_tflops	latency_us	pct_peak	speedup_vs_pytorch	correctness	peak_vram_mb	description
+1	kept	conv2d		14380.0		1.000	PASS		baseline recognizer stack before rank-17 conv candidate across six repeated 48x48 conv blocks
+2	revert	conv2d		14270.0		1.000	PASS		ConvBNAct fusion across the six rank-17 backbone blocks regresses the paired 20/200 optimized-path latency
+3	revert	conv2d		14250.0		1.000	PASS		cached channels-last weights across the six rank-17 conv blocks preserve outputs but trail the normalized long baseline

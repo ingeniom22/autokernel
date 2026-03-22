@@ -1,0 +1,7 @@
+experiment	tag	kernel_type	throughput_tflops	latency_us	pct_peak	speedup_vs_pytorch	correctness	peak_vram_mb	description
+1	kept	conv2d		14300.0		1.000	PASS		baseline recognizer stack before rank-20 depthwise 5x5 candidate across 18 repeated conv2 blocks
+2	revert	conv2d		14400.0		1.000	PASS		exact ConvBNReLU fusion across the 18 rank-20 depthwise conv2 blocks preserves outputs but slows the recognizer
+3	revert	conv2d		14600.0		1.000	PASS		cached channels-last weights make the rank-20 depthwise microbench faster but still slow the recognizer across 18 repeated blocks
+4	revert	conv2d		14300.0		1.000	PASS		enabling cuDNN autotune on the repeated rank-20 depthwise path is exact but still loses to the accepted stack
+5	revert	conv2d		14800.0		1.000	PASS		direct _conv_depthwise2d plus ConvBNReLU fusion improved the microbench but regressed the long recognizer run across 18 repeated blocks
+6	revert	conv2d		14030.0		1.000	PASS		direct conv wrapper dispatch for the single rank-20 shape trims replacement overhead but still misses the long recognizer baseline

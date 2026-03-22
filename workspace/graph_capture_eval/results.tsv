@@ -1,0 +1,38 @@
+experiment	tag	kernel_type	throughput_tflops	latency_us	pct_peak	speedup_vs_pytorch	correctness	peak_vram_mb	description
+1	kept	graph_capture		2030.0		6.998	PASS		whole-model CUDA graph capture on top of accepted layout_transform_1 baseline
+2	kept	conv2d		2010.0		1.008	PASS		rank-23 ConvBNAct fusion across three aggregation-excitation blocks on top of layout+graph_capture
+3	kept	conv2d		1940.0		1.038	PASS		rank-20 depthwise ConvBNReLU fusion across 18 repeated conv2 blocks on top of the accepted graph stack
+4	revert	conv2d		1930.0		1.001	PASS		rank-10 1x1 ConvBNAct fusion is neutral after the 400-run graph-stack confirmation
+5	revert	conv2d		1900.0		1.020	FAIL		rank-17 ConvBNAct fusion exceeds the active graph-stack tolerance (max_abs_error 3.17e-03)
+6	kept	block_fusion		1840.0		1.053	PASS		stage2 HGV2 stage-level ConvBN folding on top of the accepted graph stack, confirmed on 20/400
+7	kept	block_fusion		1760.0		1.039	PASS		stage3 block0 HGV2 block-level ConvBN folding on top of the accepted stage2 graph stack, confirmed on 20/400
+8	revert	block_fusion		1710.0		1.031	FAIL		stage0 HGV2 stage-level folding improves latency but exceeds the active tolerance (max_abs_error 4.39e-03)
+9	kept	block_fusion		1720.0		1.025	PASS		stage1 HGV2 stage-level ConvBN folding on top of the accepted stage2+stage3 graph stack, confirmed on 20/400
+10	kept	block_fusion		1710.0		1.012	PASS		stem block ConvBN folding on top of the accepted HGNet graph stack, confirmed on 20/400
+11	kept	block_fusion		1680.0		1.015	PASS		SVTR encoder conv-stack folding on top of the accepted HGNet graph stack, confirmed on 20/400
+12	revert	block_fusion		1750.0		1.304	FAIL		SVTR block-level SDPA attention rewrite on top of the accepted graph stack looked fast on a 10/100 split screen but failed tolerance (max_abs_error 7.18e-02)
+13	revert	block_fusion		1730.0		0.977	PASS		stage3 full-stage HGV2 fold replacing the accepted block-only stage3 wrapper regressed full recognizer latency on the 10/100 screen
+14	revert	graph_capture		2270.0		0.744	PASS		CUDA-graph replay without cloning the static output buffer regressed the accepted stack on the 10/100 screen
+15	kept	block_fusion		1560.0		1.082	PASS		Inductor-compiled stage2 HGV2 wrapper with inner cudagraphs disabled replaces the eager stage2 block_fusion_901 path and improves the accepted graph stack on 20/400
+16	kept	block_fusion		1500.0		1.029	PASS		Inductor-compiled SVTR encoder wrapper with inner cudagraphs disabled replaces the eager block_fusion_906 path and trims the accepted graph stack on repeated 20/400 runs
+17	kept	block_fusion		1470.0		1.024	PASS		Inductor-compiled stem wrapper with inner cudagraphs disabled replaces the eager block_fusion_905 path and improves the accepted graph stack on 20/400
+18	kept	block_fusion		1400.0		1.051	PASS		Inductor-compiled original stage0 wrapper replaces the reverted folded stage0 attempt and improves the accepted graph stack on 20/400
+19	revert	block_fusion		1400.0		1.000	PASS		Compile-only stage3 block0 swap matched the current 1.40 ms accepted latency, so it was rejected as neutral despite the in-process reference inflation during screening
+20	revert	block_fusion		1900.0		1.000	PASS		Compile-only encoder swap replacing the accepted folded+compiled encoder path regressed the recognizer to 1.90 ms on repeated 10/100 screens
+21	revert	graph_capture		1800.0		1.000	PASS		Whole-model Inductor plus outer CUDA graph capture regressed the accepted stack to 1.80 ms after the recursion fix, so it was rejected
+22	revert	block_fusion		1500.0		1.000	PASS		Stage2 preallocated-concat wrapper stayed exact but regressed the accepted stack to 1.50 ms on the 10/100 screen, so it was rejected
+23	revert	block_fusion		1900.0		1.000	PASS		Compile-opaque net.backbone swap only recovered to the existing 1.90 ms neighborhood on a reduced graph+layout+encoder screen, so it was not promoted to accepted-stack confirmation
+24	revert	block_fusion		1900.0		0.990	PASS		Compile-opaque stage2 wrapper cleanly replaced the accepted stage2 stack after the dynamic kernel-module loader fix but stayed neutral on the accepted 10/100 screen
+25	revert	block_fusion		1900.0		1.000	PASS		Compile-opaque ctc_encoder wrapper was bitwise exact but neutral on the accepted 10/100 screen
+26	revert	block_fusion		1410.0		0.996	PASS		Stage2 block-by-block compiled wrapper improved the 10/100 screen to 1.50 ms but flattened to 1.41 ms on the 20/400 confirmation, so it was rejected as non-defensible
+27	revert	block_fusion		1410.0		0.993	PASS		Compile-original net.head wrapper improved the 10/100 screen but regressed to 1.41 ms on the 20/400 confirmation, so it was rejected
+28	kept	block_fusion		1360.0		1.031	PASS		Compile-original stage3 wrapper preserves the accepted block0 specialization and improves the accepted graph stack on 20/400
+29	kept	block_fusion		1330.0		1.025	PASS		Compile-original backbone wrapper collapses the accepted backbone boundary around the current inner specializations and improves the accepted graph stack on 20/400
+30	revert	block_fusion		1790.0		1.006	PASS		Compile-original top-level net wrapper was only a 1.80 ms -> 1.79 ms screen win, so it was not promoted to 20/400 confirmation
+31	revert	block_fusion		1960.0		0.918	PASS		Stage2 concat-free squeeze-accumulate rewrite removed the explicit concat but regressed the accepted stack on the 10/100 screen
+32	revert	block_fusion		1320.0		1.002	PASS		Compile-original ctc_encoder wrapper preserved the accepted inner encoder specialization but only moved 1.33 ms -> 1.32 ms on 20/400, so it was rejected as non-defensible
+33	revert	block_fusion		1800.0		1.000	PASS		SDPA-backed SVTR encoder wrapper stayed within tolerance but was flat at 1.80 ms on the 10/100 screen, so it was rejected before 20/400 confirmation
+34	revert	block_fusion		1320.0		1.008	PASS		Stage0 blocks-only stage wrapper kept the downsample exact and looked strong on the 10/100 screen, but it flattened to 1.33 ms -> 1.32 ms on 20/400 and was rejected as non-defensible
+35	revert	block_fusion		1320.0		1.006	PASS		Stage0 block-level fold inserted ahead of the accepted outer stage0 and backbone compiles also collapsed to 1.33 ms -> 1.32 ms on 20/400, so it was rejected
+36	revert	graph_capture		1300.0		1.000	PASS		Reusable copied CUDA-graph output buffer was exact and looked better on the short screen, but it flattened to the existing 1.3 ms bin on 20/400 and was rejected
+37	revert	graph_capture		1300.0		1.000	PASS		Adopting the caller static input buffer removed the per-call input copy on the short screen, but it also flattened to the existing 1.3 ms bin on 20/400 and was rejected

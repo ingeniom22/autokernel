@@ -1,0 +1,5 @@
+experiment	tag	kernel_type	throughput_tflops	latency_us	pct_peak	speedup_vs_pytorch	correctness	peak_vram_mb	description
+1	kept	conv2d		14100.0		1.000	PASS		baseline recognizer stack before rank-16 conv candidate on top of layout_transform_1
+2	revert	conv2d		14140.0		1.000	PASS		cached channels-last weight for exact rank-16 conv preserves outputs but is neutral on the 20/200 recognizer median
+3	revert	conv2d		14120.0		1.000	PASS		exact ConvBNLayer fusion for rank-16 conv looked good on 50 runs but regressed on the 20/200 recognizer median
+4	revert	conv2d		14220.0		1.000	PASS		exact rank-16 conv1d dispatch preserves outputs but slows the recognizer versus the accepted layout-transform stack

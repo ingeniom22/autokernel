@@ -1,0 +1,3 @@
+experiment	tag	kernel_type	throughput_tflops	latency_us	pct_peak	speedup_vs_pytorch	correctness	peak_vram_mb	description
+1	failed	matmul	1.8490				FAIL		starter small matmul failed correctness and trailed torch badly on the real ppocr shape
+2	kept	matmul	0.1760			1.000	PASS		dispatch tiny matmul89 shapes to torch to recover correctness and avoid wasting cycles on a losing ppocr micro-gemm

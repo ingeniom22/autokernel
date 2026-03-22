@@ -1,0 +1,9 @@
+experiment	tag	kernel_type	throughput_tflops	latency_us	pct_peak	speedup_vs_pytorch	correctness	peak_vram_mb	description
+1	kept	conv2d		14310.0		1.000	PASS		baseline recognizer stack before rank-23 1x1 aggregation-excitation conv candidate across three ConvBNAct blocks
+2	revert	conv2d		14310.0		1.000	PASS		rank-23 ConvBNAct fusion across the three aggregation-excitation blocks stays exact but does not beat the long recognizer baseline
+3	revert	conv2d		14270.0		1.000	PASS		direct wrapper dispatch on the three rank-23 1x1 conv sites trims reinsertion overhead but still lands above the long recognizer baseline
+4	revert	conv2d		14020.0		1.000	PASS		folded ConvBNAct without NHWC copy
+5	revert	conv2d		14340.0		1.000	PASS		direct folded ConvBNAct path via child conv wrappers only
+6	kept	conv2d		14100.0		1.015	PASS		fix fused ConvBNAct parent replacement
+7	kept	conv2d		13830.0		1.035	PASS		inplace relu fast path
+8	revert	conv2d		13830.0		1.035	PASS		drop redundant channels-last check

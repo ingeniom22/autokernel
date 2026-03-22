@@ -1,0 +1,7 @@
+experiment	tag	kernel_type	throughput_tflops	latency_us	pct_peak	speedup_vs_pytorch	correctness	peak_vram_mb	description
+1	kept	batchnorm		14530.0		1.000	PASS		baseline wrapper path
+2	failed	batchnorm		14530.0		1.000	FAIL		cached affine batchnorm in fp16 failed smoke-test tolerance despite strong bench speedup
+3	failed	batchnorm		14530.0		1.000	FAIL		fp32 cached affine batchnorm remained out of tolerance and slower than baseline
+4	failed	batchnorm		15870.0		1.000	FAIL		channels-last batchnorm reduced latency but exceeded verify tolerance
+5	revert	batchnorm		16160.0		1.000	PASS		direct aten native batchnorm kept exactness but was slower than the accepted 14.53 ms baseline
+6	failed	batchnorm		14530.0		1.000	FAIL		direct cudnn_batch_norm requires fp32 affine params on this stack and failed bench compatibility

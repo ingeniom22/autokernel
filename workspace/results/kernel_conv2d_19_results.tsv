@@ -1,0 +1,7 @@
+experiment	tag	kernel_type	throughput_tflops	latency_us	pct_peak	speedup_vs_pytorch	correctness	peak_vram_mb	description
+1	kept	conv2d		14200.0		1.000	PASS		baseline recognizer stack before rank-19 1x1 squeeze-conv candidate across two ConvBNAct blocks
+2	revert	conv2d		13920.0		1.000	PASS		rank-19 ConvBNAct fusion is not a defensible recognizer win after the 20/200 confirmation run
+3	revert	conv2d		14300.0		1.000	PASS		cached channels-last weights for the exact rank-19 1x1 conv improve microbench slightly but regress the 20/200 recognizer median
+4	revert	conv2d		14300.0		1.000	PASS		forcing the exact rank-19 squeeze conv through a local NCHW path preserves outputs but loses to the accepted channels-last stack
+5	revert	conv2d		14200.0		1.000	PASS		enabling cuDNN autotune on the exact rank-19 path is numerically exact but neutral on the 20/200 recognizer median
+6	revert	conv2d		15400.0		1.000	PASS		forcing fresh dense channels-last tensors on the exact rank-19 path showed a one-off 14.5->14.4 ms blip but failed the confirmation run at 15.4 ms

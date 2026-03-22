@@ -1,0 +1,3 @@
+experiment	tag	kernel_type	throughput_tflops	latency_us	pct_peak	speedup_vs_pytorch	correctness	peak_vram_mb	description
+1	kept	layout_transform		14830.0		1.000	PASS		baseline long verify 20/200 before global channels-last layout transform
+2	kept	layout_transform		14030.0		1.057	PASS		global channels-last layout strategy; default verify passes via kernel metadata tolerance

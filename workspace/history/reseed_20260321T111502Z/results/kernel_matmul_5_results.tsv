@@ -1,0 +1,3 @@
+experiment	tag	kernel_type	throughput_tflops	latency_us	pct_peak	speedup_vs_pytorch	correctness	peak_vram_mb	description
+1	kept	matmul		14190.0		1.000	PASS		baseline recognizer stack before rank-5 matmul candidate
+2	revert	matmul		14770.0		1.000	PASS		grouped launch with safe fallbacks passes bench but regresses recognizer versus the current accepted stack

@@ -1,0 +1,8 @@
+experiment	tag	kernel_type	throughput_tflops	latency_us	pct_peak	speedup_vs_pytorch	correctness	peak_vram_mb	description
+1	kept	conv2d		14830.0		1.000	PASS		baseline wrapper path
+2	failed	conv2d		14830.0		1.000	FAIL		channels-last cached weights failed bench correctness on bf16 depthwise sweep
+3	failed	conv2d		15420.0		1.000	FAIL		fp16 channels-last path across all convs slowed verify and exceeded output tolerance
+4	failed	conv2d		16600.0		1.000	FAIL		shape-gated channels-last fast path still regressed verify and exceeded tolerance
+5	failed	conv2d		14830.0		1.000	FAIL		height-collapse conv path crashed on modules using string padding modes
+6	revert	conv2d		15270.0		1.000	PASS		H=1 kernel-height collapse preserved numerics but slowed recognizer latency
+1	revert	conv2d		14300.0		1.000	PASS		cached channels-last weight for exact rank-3 conv; no end-to-end gain on stacked verify 20/200

@@ -1,0 +1,4 @@
+experiment	tag	kernel_type	throughput_tflops	latency_us	pct_peak	speedup_vs_pytorch	correctness	peak_vram_mb	description
+1	kept	conv2d		14210.0		1.000	PASS		baseline recognizer stack before rank-12 conv candidate
+2	revert	conv2d		15510.0		1.000	PASS		baseline conv12 wrapper is exact but substantially regresses the long recognizer median
+3	revert	conv2d		14100.0		1.000	PASS		rank-12 ConvBNAct fusion is exact but neutral on the 200-run recognizer median after a slightly worse 50-run check

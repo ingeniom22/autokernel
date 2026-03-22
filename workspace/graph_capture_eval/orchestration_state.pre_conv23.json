@@ -1,0 +1,25 @@
+{
+  "current_kernel_idx": 1,
+  "current_kernel_file": "workspace/kernel_graph_capture_900.py",
+  "started_at": "2026-03-21T13:00:00Z",
+  "kernels": [
+    {
+      "rank": 1,
+      "file": "workspace/kernel_layout_transform_1.py",
+      "optimized_path": "/workspace/ppocr-triton/autokernel/workspace/kernel_layout_transform_1_optimized.py",
+      "op_type": "layout_transform",
+      "status": "done",
+      "end_to_end_speedup": 1.057,
+      "speedup": 1.057
+    },
+    {
+      "rank": 900,
+      "file": "workspace/kernel_graph_capture_900.py",
+      "optimized_path": "/workspace/ppocr-triton/autokernel/workspace/kernel_graph_capture_900_optimized.py",
+      "op_type": "graph_capture",
+      "status": "optimizing",
+      "end_to_end_speedup": 1.0,
+      "speedup": 1.0
+    }
+  ]
+}

@@ -1,0 +1,45 @@
+{
+  "model": "PPOCRv5ServerRecModel",
+  "input_shape": "1,3,48,320",
+  "dtype": "float16",
+  "gpu": "NVIDIA GeForce RTX 2080 Ti",
+  "reference": {
+    "output_shape": "[1, 40, 18385]",
+    "latency_ms": 14.05
+  },
+  "optimized": {
+    "output_shape": "[1, 40, 18385]",
+    "latency_ms": 2.03,
+    "kernels_replaced": [
+      {
+        "type": "layout_transform",
+        "rank": 1,
+        "speedup": 1.057,
+        "path": "/workspace/ppocr-triton/autokernel/workspace/kernel_layout_transform_1_optimized.py",
+        "modules_replaced": 1
+      },
+      {
+        "type": "graph_capture",
+        "rank": 900,
+        "speedup": 1.0,
+        "path": "/workspace/ppocr-triton/autokernel/workspace/kernel_graph_capture_900_optimized.py",
+        "modules_replaced": 1
+      }
+    ],
+    "kernels_skipped": []
+  },
+  "verification": {
+    "correctness": "PASS",
+    "max_abs_error": 0.0,
+    "mean_abs_error": 0.0,
+    "has_nan": false,
+    "has_inf": false
+  },
+  "summary": {
+    "original_latency_ms": 14.05,
+    "optimized_latency_ms": 2.03,
+    "end_to_end_speedup": 6.935,
+    "kernels_replaced": 2,
+    "kernels_skipped": 0
+  }
+}

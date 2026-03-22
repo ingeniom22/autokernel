@@ -1,0 +1,214 @@
+{
+    "primary_metric": "recognizer_latency_ms",
+    "latency_scope": "ppocr_recognizer",
+    "acceptance_policy": "Keep kernel candidates only when correctness passes and end-to-end PPOCRv5ServerRecModel latency improves.",
+    "kernels_to_optimize": [
+        {
+            "rank": 1,
+            "file": "workspace/kernel_layout_transform_1.py",
+            "op_type": "layout_transform",
+            "model_shape": {
+                "N": 1,
+                "C": 192,
+                "H": 6,
+                "W": 80
+            },
+            "gpu_time_ms": 3.539,
+            "pct_total": 6.7,
+            "estimated_speedup_potential": "1.1-1.5x"
+        },
+        {
+            "rank": 2,
+            "file": "workspace/kernel_batchnorm_2.py",
+            "op_type": "batchnorm",
+            "model_shape": {
+                "N": 1,
+                "C": 192,
+                "H": 6,
+                "W": 80
+            },
+            "gpu_time_ms": 2.834,
+            "pct_total": 5.3,
+            "estimated_speedup_potential": "1.2-1.8x"
+        },
+        {
+            "rank": 3,
+            "file": "workspace/kernel_conv2d_3.py",
+            "op_type": "conv2d",
+            "model_shape": {
+                "N": 1,
+                "C_in": 4096,
+                "C_out": 256,
+                "H": 1,
+                "W": 40,
+                "KH": 3,
+                "KW": 3,
+                "stride_h": 1,
+                "stride_w": 1,
+                "pad_h": 1,
+                "pad_w": 1,
+                "dil_h": 1,
+                "dil_w": 1,
+                "groups": 1
+            },
+            "gpu_time_ms": 2.793,
+            "pct_total": 5.3,
+            "estimated_speedup_potential": "1.2-2x"
+        },
+        {
+            "rank": 4,
+            "file": "workspace/kernel_layout_transform_4.py",
+            "op_type": "layout_transform",
+            "model_shape": {
+                "N": 1,
+                "C": 192,
+                "H": 6,
+                "W": 80
+            },
+            "gpu_time_ms": 2.343,
+            "pct_total": 4.4,
+            "estimated_speedup_potential": "1.1-1.5x"
+        },
+        {
+            "rank": 5,
+            "file": "workspace/kernel_matmul_5.py",
+            "op_type": "matmul",
+            "model_shape": {
+                "M": 2048,
+                "N": 2048,
+                "K": 2048
+            },
+            "gpu_time_ms": 1.933,
+            "pct_total": 3.6,
+            "estimated_speedup_potential": "2-3x"
+        },
+        {
+            "rank": 6,
+            "file": "workspace/kernel_batchnorm_6.py",
+            "op_type": "batchnorm",
+            "model_shape": {
+                "N": 1,
+                "C": 192,
+                "H": 6,
+                "W": 80
+            },
+            "gpu_time_ms": 1.741,
+            "pct_total": 3.3,
+            "estimated_speedup_potential": "1.2-1.8x"
+        },
+        {
+            "rank": 7,
+            "file": "workspace/kernel_batchnorm_7.py",
+            "op_type": "batchnorm",
+            "model_shape": {
+                "N": 1,
+                "C": 192,
+                "H": 6,
+                "W": 80
+            },
+            "gpu_time_ms": 1.626,
+            "pct_total": 3.1,
+            "estimated_speedup_potential": "1.2-1.8x"
+        },
+        {
+            "rank": 8,
+            "file": "workspace/kernel_matmul_8.py",
+            "op_type": "matmul",
+            "model_shape": {
+                "M": 2048,
+                "N": 2048,
+                "K": 2048
+            },
+            "gpu_time_ms": 1.508,
+            "pct_total": 2.8,
+            "estimated_speedup_potential": "2-3x"
+        },
+        {
+            "rank": 9,
+            "file": "workspace/kernel_conv2d_9.py",
+            "op_type": "conv2d",
+            "model_shape": {
+                "N": 1,
+                "C_in": 64,
+                "C_out": 64,
+                "H": 48,
+                "W": 320,
+                "KH": 3,
+                "KW": 3,
+                "stride_h": 1,
+                "stride_w": 1,
+                "pad_h": 1,
+                "pad_w": 1,
+                "dil_h": 1,
+                "dil_w": 1,
+                "groups": 1
+            },
+            "gpu_time_ms": 1.446,
+            "pct_total": 2.7,
+            "estimated_speedup_potential": "1.2-2x"
+        },
+        {
+            "rank": 10,
+            "file": "workspace/kernel_conv2d_10.py",
+            "op_type": "conv2d",
+            "model_shape": {
+                "N": 1,
+                "C_in": 192,
+                "C_out": 192,
+                "H": 6,
+                "W": 80,
+                "KH": 1,
+                "KW": 1,
+                "stride_h": 1,
+                "stride_w": 1,
+                "pad_h": 0,
+                "pad_w": 0,
+                "dil_h": 1,
+                "dil_w": 1,
+                "groups": 1
+            },
+            "gpu_time_ms": 1.392,
+            "pct_total": 2.6,
+            "estimated_speedup_potential": "1.2-2x"
+        },
+        {
+            "rank": 11,
+            "file": "workspace/kernel_matmul_11.py",
+            "op_type": "matmul",
+            "model_shape": {
+                "M": 2048,
+                "N": 2048,
+                "K": 2048
+            },
+            "gpu_time_ms": 1.379,
+            "pct_total": 2.6,
+            "estimated_speedup_potential": "2-3x"
+        },
+        {
+            "rank": 12,
+            "file": "workspace/kernel_conv2d_12.py",
+            "op_type": "conv2d",
+            "model_shape": {
+                "N": 1,
+                "C_in": 96,
+                "C_out": 96,
+                "H": 12,
+                "W": 80,
+                "KH": 3,
+                "KW": 3,
+                "stride_h": 1,
+                "stride_w": 1,
+                "pad_h": 1,
+                "pad_w": 1,
+                "dil_h": 1,
+                "dil_w": 1,
+                "groups": 1
+            },
+            "gpu_time_ms": 1.269,
+            "pct_total": 2.4,
+            "estimated_speedup_potential": "1.2-2x"
+        }
+    ],
+    "total_optimization_targets": 12,
+    "covered_gpu_time_pct": 44.8
+}

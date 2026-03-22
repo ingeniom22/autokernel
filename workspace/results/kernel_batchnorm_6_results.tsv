@@ -1,0 +1,3 @@
+experiment	tag	kernel_type	throughput_tflops	latency_us	pct_peak	speedup_vs_pytorch	correctness	peak_vram_mb	description
+1	kept	batchnorm		14420.0		1.000	PASS		baseline recognizer stack before rank-6 batchnorm candidate
+2	revert	batchnorm		14500.0		1.000	PASS		generic batchnorm wrapper preserves outputs but regresses recognizer latency under the current accepted stack

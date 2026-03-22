@@ -1,0 +1,7 @@
+experiment	tag	kernel_type	throughput_tflops	latency_us	pct_peak	speedup_vs_pytorch	correctness	peak_vram_mb	description
+1	kept	conv2d		14860.0		1.000	PASS		baseline wrapper path
+2	revert	conv2d		16490.0		1.000	PASS		shape-exact 1x1 GEMM rewrite preserved numerics but regressed recognizer latency
+3	revert	conv2d		16020.0		1.000	PASS		1x1 GEMM with channels-last output remained exact but regressed recognizer latency
+4	failed	conv2d		15440.0		1.000	FAIL		exact-shape channels-last conv path exceeded verify tolerance and regressed latency
+5	kept	conv2d		14460.0		1.028	PASS		rebased baseline wrapper path atop accepted batchnorm kernel
+6	failed	conv2d		14460.0		1.000	FAIL		aten.convolution path broke on modules using string padding modes

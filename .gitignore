@@ -7,7 +7,7 @@ wheels/
 *.egg-info
 
 # Virtual environments
-.venv
+.venv/
 worktrees/
 
 # Agent prompt files
@@ -23,16 +23,23 @@ run.log
 # Cache
 .cache/
 
-# Analysis output (regenerated)
+# Analysis output
 report.md
 
 # Profiler traces
 traces/
 
-# Workspace (runtime artifacts)
-#workspace/
-
+# Model files
 *.pdiparams
 *.pdparams
 *.pth
-*.ipynb_checkpoints/
+
+# Notebook junk
+.ipynb_checkpoints/
+
+# Allow selected workspace artifacts
+!workspace/**/*.tsv
+!workspace/**/*.md
+!workspace/**/*.yaml
+!workspace/**/*.yml
+!workspace/**/*.py

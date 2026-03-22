@@ -1,0 +1,5 @@
+experiment	tag	kernel_type	throughput_tflops	latency_us	pct_peak	speedup_vs_pytorch	correctness	peak_vram_mb	description
+1	failed	matmul	1.9920				FAIL		starter extracted aten::mm kernel failed correctness on deep_k and edge shapes
+2	failed	matmul	0.1760				FAIL		grouped ppocr tiling fixed deep_k but still failed edge_1023 correctness
+3	kept	matmul	0.1770			1.000	PASS		establish correct baseline while preserving the real ppocr shape path
+4	revert	matmul	0.1770			1.000	PASS		wider ppocr N tile did not improve bench and regressed the real model shape badly

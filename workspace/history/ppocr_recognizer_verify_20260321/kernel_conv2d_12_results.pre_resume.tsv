@@ -1,0 +1,4 @@
+experiment	tag	kernel_type	throughput_tflops	latency_us	pct_peak	speedup_vs_pytorch	correctness	peak_vram_mb	description
+1	kept	conv2d		14800.0		1.000	PASS		baseline long verify 20/200 (5 matched conv modules)
+2	revert	conv2d		14890.0		1.000	PASS		fused ConvBNAct parent wrapper (Conv+BN fold + ReLU) slower on verify 20/200
+3	revert	conv2d		16420.0		1.000	PASS		fused ConvBNAct + channels_last slower on verify 20/200

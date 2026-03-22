@@ -1,0 +1,82 @@
+{
+  "current_kernel_idx": 0,
+  "current_kernel_file": "workspace/kernel_matmul_5.py",
+  "started_at": "2026-03-21T04:00:05",
+  "kernels": [
+    {
+      "rank": 5,
+      "file": "workspace/kernel_matmul_5.py",
+      "op_type": "matmul",
+      "pct_total": 3.6,
+      "status": "optimizing",
+      "baseline_tflops": 0.177,
+      "best_tflops": 0.177,
+      "speedup": 1.0,
+      "pct_peak": null,
+      "experiments_run": 2,
+      "experiments_kept": 1,
+      "consecutive_reverts": 0,
+      "time_spent_minutes": 4
+    },
+    {
+      "rank": 8,
+      "file": "workspace/kernel_matmul_8.py",
+      "op_type": "matmul",
+      "pct_total": 2.8,
+      "status": "pending",
+      "baseline_tflops": null,
+      "best_tflops": null,
+      "speedup": null,
+      "pct_peak": null,
+      "experiments_run": 0,
+      "experiments_kept": 0,
+      "consecutive_reverts": 0,
+      "time_spent_minutes": 0
+    },
+    {
+      "rank": 11,
+      "file": "workspace/kernel_matmul_11.py",
+      "op_type": "matmul",
+      "pct_total": 2.6,
+      "status": "pending",
+      "baseline_tflops": null,
+      "best_tflops": null,
+      "speedup": null,
+      "pct_peak": null,
+      "experiments_run": 0,
+      "experiments_kept": 0,
+      "consecutive_reverts": 0,
+      "time_spent_minutes": 0
+    },
+    {
+      "rank": 13,
+      "file": "workspace/kernel_matmul_13.py",
+      "op_type": "matmul",
+      "pct_total": 2.3,
+      "status": "pending",
+      "baseline_tflops": null,
+      "best_tflops": null,
+      "speedup": null,
+      "pct_peak": null,
+      "experiments_run": 0,
+      "experiments_kept": 0,
+      "consecutive_reverts": 0,
+      "time_spent_minutes": 0
+    },
+    {
+      "rank": 14,
+      "file": "workspace/kernel_matmul_14.py",
+      "op_type": "matmul",
+      "pct_total": 2.2,
+      "status": "pending",
+      "baseline_tflops": null,
+      "best_tflops": null,
+      "speedup": null,
+      "pct_peak": null,
+      "experiments_run": 0,
+      "experiments_kept": 0,
+      "consecutive_reverts": 0,
+      "time_spent_minutes": 0
+    }
+  ]
+}

@@ -1,0 +1,2 @@
+experiment	tag	kernel_type	throughput_tflops	latency_us	pct_peak	speedup_vs_pytorch	correctness	peak_vram_mb	description
+1	revert	batchnorm		14190.0		1.000	PASS		generic all-batchnorm wrapper on top of accepted layout-transform stack; neutral on verify 20/200
