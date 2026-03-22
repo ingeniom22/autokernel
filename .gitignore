@@ -30,4 +30,9 @@ report.md
 traces/
 
 # Workspace (runtime artifacts)
-workspace/
+#workspace/
+
+*.pdiparams
+*.pdparams
+*.pth
+*.ipynb_checkpoints/
