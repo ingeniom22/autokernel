@@ -15,6 +15,7 @@ PROFILE_SUPPORTED_OP_TYPES = frozenset(
         "softmax",
         "layernorm",
         "rmsnorm",
+        "batchnorm",
         "flash_attention",
         "fused_mlp",
         "cross_entropy",
@@ -23,6 +24,8 @@ PROFILE_SUPPORTED_OP_TYPES = frozenset(
         "conv2d",
         "depthwise_conv2d",
         "conv_transpose2d",
+        "layout_transform",
+        "graph_capture",
         "interpolate",
         "concat",
         "elementwise",
@@ -30,7 +33,19 @@ PROFILE_SUPPORTED_OP_TYPES = frozenset(
     }
 )
 
-REINSERT_SUPPORTED_OP_TYPES = frozenset({"matmul", "layernorm", "rmsnorm", "softmax"})
+REINSERT_SUPPORTED_OP_TYPES = frozenset(
+    {
+        "matmul",
+        "layernorm",
+        "rmsnorm",
+        "softmax",
+        "conv2d",
+        "batchnorm",
+        "layout_transform",
+        "graph_capture",
+        "block_fusion",
+    }
+)
 
 
 def build_support_stage(

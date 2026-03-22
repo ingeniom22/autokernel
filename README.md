@@ -117,6 +117,45 @@ uv run profile.py --module transformers --class-name AutoModelForCausalLM \
  --pretrained meta-llama/Llama-2-7b-hf --input-shape 1,2048 --dtype float16
 ```
 
+## PP-OCRv5 Workflow
+
+PP-OCRv5 server detector and recognizer are supported through the sibling
+`PaddleOCR2Pytorch` checkout in this workspace.
+
+Install the OCR stack:
+
+```bash
+uv sync --extra ppocr --extra ppocr-conversion
+```
+
+Prepare converted checkpoints from Paddle weights:
+
+```bash
+export AUTOKERNEL_PPOCRV5_SERVER_DET_PDPARAMS=/path/to/PP-OCRv5_server_det.pdparams
+export AUTOKERNEL_PPOCRV5_SERVER_REC_PDPARAMS=/path/to/PP-OCRv5_server_rec.pdparams
+uv run scripts/prepare_ppocrv5_server.py
+```
+
+Profile the detector and recognizer separately:
+
+```bash
+uv run profile.py --model models/ppocrv5_server.py \
+ --class-name PPOCRv5ServerDetModel --input-shape 1,3,640,640 --dtype float32
+
+uv run profile.py --model models/ppocrv5_server.py \
+ --class-name PPOCRv5ServerRecModel --input-shape 1,3,48,320 --dtype float32
+```
+
+Run PP-OCR parity checks against the PaddleOCR2Pytorch reference pipeline:
+
+```bash
+uv run scripts/verify_ppocrv5_server.py
+```
+
+Current support is intentionally explicit:
+- recognition can already surface operator families that overlap with existing AutoKernel reinsertion paths
+- detection is fully loadable, profileable, and parity-testable, but much of its runtime is conv-heavy and may be reported as extract-only or unsupported for reinsertion
+
 ## KernelBench Integration
 
 AutoKernel integrates with [KernelBench](https://github.com/ScalingIntelligence/KernelBench),

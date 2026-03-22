@@ -5,7 +5,7 @@ AutoKernel Multi-Kernel Orchestrator -- Schedule and track optimization across k
 Usage:
     uv run orchestrate.py status                    # show current optimization state
     uv run orchestrate.py next                      # print which kernel to optimize next
-    uv run orchestrate.py record <kernel_file> <throughput_tflops> <status> <description>
+    uv run orchestrate.py record <kernel_file> <metric_value> <status> <description>
     uv run orchestrate.py report                    # generate aggregate report
     uv run orchestrate.py plan                      # show the full optimization plan with estimated impact
 
@@ -114,6 +114,7 @@ def _default_kernel_entry(
     file: str,
     op_type: str,
     pct_total: float = 0.0,
+    primary_metric: str = "throughput_tflops",
 ) -> dict:
     """Return a default kernel entry for the orchestration state."""
     return {
@@ -121,9 +122,13 @@ def _default_kernel_entry(
         "file": file,
         "op_type": op_type,
         "pct_total": pct_total,
+        "primary_metric": primary_metric,
         "status": STATUS_PENDING,
         "baseline_tflops": None,
         "best_tflops": None,
+        "baseline_recognizer_latency_ms": None,
+        "best_recognizer_latency_ms": None,
+        "end_to_end_speedup": None,
         "speedup": None,
         "pct_peak": None,
         "experiments_run": 0,
@@ -144,6 +149,7 @@ def _initialize_state_from_plan(plan: dict) -> dict:
                 file=kp.get("file", f"workspace/kernel_{kp.get('op_type', 'unknown')}_{i+1}.py"),
                 op_type=kp.get("op_type", "unknown"),
                 pct_total=kp.get("pct_total", 0.0),
+                primary_metric=kp.get("primary_metric", plan.get("primary_metric", "throughput_tflops")),
             )
         )
 
@@ -267,7 +273,7 @@ def estimate_aggregate_speedup(kernels: list[dict]) -> float:
     """
     remaining_frac = 1.0
     for k in kernels:
-        speedup = k.get("speedup")
+        speedup = k.get("speedup") or k.get("end_to_end_speedup")
         pct = k.get("pct_total", 0.0)
         if speedup is not None and speedup > 1.0 and pct > 0:
             frac = pct / 100.0
@@ -285,7 +291,7 @@ def _hypothetical_speedup(kernels: list[dict], assumed_speedup: float, top_n: in
     for k in sorted_k[:top_n]:
         pct = k.get("pct_total", 0.0)
         # Use actual speedup if already achieved and better, else assumed
-        actual = k.get("speedup")
+        actual = k.get("speedup") or k.get("end_to_end_speedup")
         s = max(actual, assumed_speedup) if actual and actual > 1.0 else assumed_speedup
         frac = pct / 100.0
         remaining_frac -= frac * (1.0 - 1.0 / s)
@@ -325,7 +331,7 @@ def _should_move_on(kernel: dict) -> tuple[bool, str]:
             f"(max: {MOVE_ON_CRITERIA['max_minutes_per_kernel']} min)"
         )
 
-    speedup = kernel.get("speedup")
+    speedup = kernel.get("end_to_end_speedup") or kernel.get("speedup")
     if speedup is not None and speedup >= MOVE_ON_CRITERIA["speedup_threshold"]:
         return True, (
             f"Strong speedup achieved: {speedup:.2f}x "
@@ -376,7 +382,15 @@ def cmd_status(state: dict) -> None:
         baseline = current["baseline_tflops"]
         best = current["best_tflops"]
         speedup = current["speedup"]
-        if baseline is not None and best is not None and speedup is not None:
+        base_latency = current.get("baseline_recognizer_latency_ms")
+        best_latency = current.get("best_recognizer_latency_ms")
+        e2e_speedup = current.get("end_to_end_speedup")
+        if base_latency is not None and best_latency is not None and e2e_speedup is not None:
+            print(
+                f"  Recognizer latency: {base_latency:.2f} ms -> {best_latency:.2f} ms "
+                f"({e2e_speedup:.2f}x end-to-end speedup)"
+            )
+        elif baseline is not None and best is not None and speedup is not None:
             print(f"  Baseline: {baseline:.1f} TFLOPS -> Current best: {best:.1f} TFLOPS ({speedup:.1f}x speedup)")
         elif baseline is not None:
             print(f"  Baseline: {baseline:.1f} TFLOPS (no improvement yet)")
@@ -389,7 +403,9 @@ def cmd_status(state: dict) -> None:
         tag = _STATUS_DISPLAY.get(k["status"], k["status"].upper())
         op = k["op_type"]
         rank = k["rank"]
-        if k["status"] in (STATUS_DONE, STATUS_OPTIMIZING) and k["speedup"] is not None:
+        if k["status"] in (STATUS_DONE, STATUS_OPTIMIZING) and k.get("end_to_end_speedup") is not None:
+            detail = f"{k['end_to_end_speedup']:.2f}x recognizer speedup, {k['experiments_run']} experiments"
+        elif k["status"] in (STATUS_DONE, STATUS_OPTIMIZING) and k["speedup"] is not None:
             detail = f"{k['speedup']:.1f}x speedup, {k['experiments_run']} experiments"
         elif k["status"] == STATUS_SKIPPED:
             detail = "skipped"
@@ -452,9 +468,10 @@ def cmd_next(state: dict) -> None:
         kname = Path(current["file"]).name
         print(f"DECISION: Continue optimizing {kname}")
         print(f"  Reason: {reason}")
+        speedup = current.get("end_to_end_speedup") or current.get("speedup")
         print(f"  Rank {current['rank']} | {current['op_type']} | "
               f"{current['experiments_run']} experiments | "
-              f"speedup {current['speedup'] or 'N/A'}")
+              f"speedup {speedup or 'N/A'}")
 
 
 def _transition_to(state: dict, next_idx: int) -> None:
@@ -473,7 +490,14 @@ def _print_next_decision(state: dict, kernel: dict, reason: str) -> None:
     print(f"  File: {kernel['file']}")
 
 
-def cmd_record(state: dict, kernel_file: str, throughput_tflops: float, status: str, description: str) -> None:
+def cmd_record(
+    state: dict,
+    kernel_file: str,
+    metric_value: float,
+    status: str,
+    description: str,
+    metric_name: str = "throughput_tflops",
+) -> None:
     """
     Record an experiment result for a kernel.
 
@@ -507,19 +531,8 @@ def cmd_record(state: dict, kernel_file: str, throughput_tflops: float, status: 
     if is_kept:
         target["experiments_kept"] += 1
         target["consecutive_reverts"] = 0
-        # Update best if improved
-        if target["best_tflops"] is None or throughput_tflops > target["best_tflops"]:
-            target["best_tflops"] = throughput_tflops
-        # Set baseline on first kept result if not already set
-        if target["baseline_tflops"] is None:
-            target["baseline_tflops"] = throughput_tflops
     elif is_revert:
         target["consecutive_reverts"] += 1
-        # First experiment sets the baseline even on revert
-        if target["baseline_tflops"] is None:
-            target["baseline_tflops"] = throughput_tflops
-        if target["best_tflops"] is None:
-            target["best_tflops"] = throughput_tflops
     elif is_failure:
         target["consecutive_reverts"] += 1
     else:
@@ -527,9 +540,42 @@ def cmd_record(state: dict, kernel_file: str, throughput_tflops: float, status: 
         print(f"WARNING: Unrecognized status '{status}', treating as revert.")
         target["consecutive_reverts"] += 1
 
-    # Compute speedup
-    if target["baseline_tflops"] and target["best_tflops"] and target["baseline_tflops"] > 0:
-        target["speedup"] = round(target["best_tflops"] / target["baseline_tflops"], 3)
+    if metric_name == "recognizer_latency_ms":
+        if is_kept:
+            if (
+                target["best_recognizer_latency_ms"] is None
+                or metric_value < target["best_recognizer_latency_ms"]
+            ):
+                target["best_recognizer_latency_ms"] = metric_value
+            if target["baseline_recognizer_latency_ms"] is None:
+                target["baseline_recognizer_latency_ms"] = metric_value
+        elif is_revert:
+            if target["baseline_recognizer_latency_ms"] is None:
+                target["baseline_recognizer_latency_ms"] = metric_value
+            if target["best_recognizer_latency_ms"] is None:
+                target["best_recognizer_latency_ms"] = metric_value
+
+        baseline_latency = target.get("baseline_recognizer_latency_ms")
+        best_latency = target.get("best_recognizer_latency_ms")
+        if baseline_latency and best_latency and best_latency > 0:
+            target["end_to_end_speedup"] = round(baseline_latency / best_latency, 3)
+            target["speedup"] = target["end_to_end_speedup"]
+            target["primary_metric"] = "recognizer_latency_ms"
+    else:
+        if is_kept:
+            if target["best_tflops"] is None or metric_value > target["best_tflops"]:
+                target["best_tflops"] = metric_value
+            if target["baseline_tflops"] is None:
+                target["baseline_tflops"] = metric_value
+        elif is_revert:
+            if target["baseline_tflops"] is None:
+                target["baseline_tflops"] = metric_value
+            if target["best_tflops"] is None:
+                target["best_tflops"] = metric_value
+
+        if target["baseline_tflops"] and target["best_tflops"] and target["baseline_tflops"] > 0:
+            target["speedup"] = round(target["best_tflops"] / target["baseline_tflops"], 3)
+            target["primary_metric"] = "throughput_tflops"
 
     # Update time_spent_minutes from started_at
     started = state.get("started_at")
@@ -552,10 +598,14 @@ def cmd_record(state: dict, kernel_file: str, throughput_tflops: float, status: 
         "experiment": target["experiments_run"],
         "tag": tag_label,
         "kernel_type": target["op_type"],
-        "throughput_tflops": f"{throughput_tflops:.4f}" if throughput_tflops else "0",
-        "latency_us": "",
+        "throughput_tflops": f"{metric_value:.4f}" if metric_name == "throughput_tflops" and metric_value else "",
+        "latency_us": f"{metric_value * 1000.0:.1f}" if metric_name == "recognizer_latency_ms" else "",
         "pct_peak": "",
-        "speedup_vs_pytorch": f"{target['speedup']:.3f}" if target["speedup"] else "",
+        "speedup_vs_pytorch": (
+            f"{(target.get('end_to_end_speedup') or target.get('speedup')):.3f}"
+            if (target.get("end_to_end_speedup") or target.get("speedup"))
+            else ""
+        ),
         "correctness": correctness,
         "peak_vram_mb": "",
         "description": description,
@@ -566,9 +616,17 @@ def cmd_record(state: dict, kernel_file: str, throughput_tflops: float, status: 
 
     # Summary
     kname = Path(target["file"]).name
-    print(f"Recorded: {kname} exp #{target['experiments_run']} -> {tag_label} ({throughput_tflops:.2f} TFLOPS)")
-    if target["speedup"]:
-        print(f"  Speedup: {target['speedup']:.2f}x | Best: {target['best_tflops']:.2f} TFLOPS")
+    if metric_name == "recognizer_latency_ms":
+        print(f"Recorded: {kname} exp #{target['experiments_run']} -> {tag_label} ({metric_value:.2f} ms recognizer latency)")
+        if target.get("end_to_end_speedup"):
+            print(
+                f"  End-to-end speedup: {target['end_to_end_speedup']:.2f}x | "
+                f"Best latency: {target['best_recognizer_latency_ms']:.2f} ms"
+            )
+    else:
+        print(f"Recorded: {kname} exp #{target['experiments_run']} -> {tag_label} ({metric_value:.2f} TFLOPS)")
+        if target["speedup"]:
+            print(f"  Speedup: {target['speedup']:.2f}x | Best: {target['best_tflops']:.2f} TFLOPS")
     if target["consecutive_reverts"] > 0 and not is_kept:
         print(f"  Consecutive reverts: {target['consecutive_reverts']}"
               f" / {MOVE_ON_CRITERIA['consecutive_reverts']} until move-on")
@@ -590,21 +648,38 @@ def cmd_report(state: dict) -> None:
     # ---- Per-kernel summary table ----
     lines.append("## Per-Kernel Summary")
     lines.append("")
-    lines.append("| Rank | Kernel | Op Type | Status | Baseline (TFLOPS) | Best (TFLOPS) | Speedup | Experiments | Kept | Keep Rate | Time (min) |")
-    lines.append("|------|--------|---------|--------|-------------------|---------------|---------|-------------|------|-----------|------------|")
+    lines.append("| Rank | Kernel | Op Type | Status | Primary Metric | Baseline | Best | Speedup | Experiments | Kept | Keep Rate | Time (min) |")
+    lines.append("|------|--------|---------|--------|----------------|----------|------|---------|-------------|------|-----------|------------|")
 
     for k in kernels:
         kname = Path(k["file"]).name
-        baseline_str = f"{k['baseline_tflops']:.2f}" if k["baseline_tflops"] is not None else "--"
-        best_str = f"{k['best_tflops']:.2f}" if k["best_tflops"] is not None else "--"
-        speedup_str = f"{k['speedup']:.2f}x" if k["speedup"] is not None else "--"
+        metric_name = k.get("primary_metric", "throughput_tflops")
+        if metric_name == "recognizer_latency_ms":
+            baseline_str = (
+                f"{k['baseline_recognizer_latency_ms']:.2f} ms"
+                if k["baseline_recognizer_latency_ms"] is not None
+                else "--"
+            )
+            best_str = (
+                f"{k['best_recognizer_latency_ms']:.2f} ms"
+                if k["best_recognizer_latency_ms"] is not None
+                else "--"
+            )
+            speedup_value = k.get("end_to_end_speedup") or k.get("speedup")
+            metric_label = "recognizer_latency_ms"
+        else:
+            baseline_str = f"{k['baseline_tflops']:.2f} TFLOPS" if k["baseline_tflops"] is not None else "--"
+            best_str = f"{k['best_tflops']:.2f} TFLOPS" if k["best_tflops"] is not None else "--"
+            speedup_value = k.get("speedup")
+            metric_label = "throughput_tflops"
+        speedup_str = f"{speedup_value:.2f}x" if speedup_value is not None else "--"
         exp_run = k["experiments_run"]
         exp_kept = k["experiments_kept"]
         keep_rate = f"{exp_kept / exp_run * 100:.0f}%" if exp_run > 0 else "--"
         minutes = k["time_spent_minutes"]
         status = _STATUS_DISPLAY.get(k["status"], k["status"])
         lines.append(
-            f"| {k['rank']} | {kname} | {k['op_type']} | {status} | {baseline_str} | "
+            f"| {k['rank']} | {kname} | {k['op_type']} | {status} | {metric_label} | {baseline_str} | "
             f"{best_str} | {speedup_str} | {exp_run} | {exp_kept} | {keep_rate} | {minutes} |"
         )
     lines.append("")
@@ -624,7 +699,7 @@ def cmd_report(state: dict) -> None:
     lines.append("")
     for k in kernels:
         pct = k.get("pct_total", 0)
-        speedup = k.get("speedup")
+        speedup = k.get("end_to_end_speedup") or k.get("speedup")
         kname = Path(k["file"]).name
         if pct > 0:
             speedup_str = f"{speedup:.2f}x" if speedup and speedup > 1.0 else "1.00x"
@@ -666,7 +741,7 @@ def cmd_report(state: dict) -> None:
     has_headroom = False
     for k in kernels:
         reasons: list[str] = []
-        speedup = k.get("speedup")
+        speedup = k.get("end_to_end_speedup") or k.get("speedup")
         pct_peak = k.get("pct_peak")
         pct_total = k.get("pct_total", 0)
 
@@ -740,6 +815,12 @@ def cmd_plan(state: dict) -> None:
     if total_gpu_time > 0:
         print(f"  Total profiled GPU time: {total_gpu_time:.1f} ms")
         print()
+    primary_metric = plan.get("primary_metric")
+    if primary_metric:
+        print(f"  Primary acceptance metric: {primary_metric}")
+        if plan.get("latency_scope"):
+            print(f"  Latency scope: {plan['latency_scope']}")
+        print()
 
     print(f"  {'Rank':<5} {'Op Type':<20} {'Shape':<30} {'GPU Time (ms)':<15} {'% Total':<10} {'Status':<12} {'Speedup':<10}")
     print(f"  {'-'*5} {'-'*20} {'-'*30} {'-'*15} {'-'*10} {'-'*12} {'-'*10}")
@@ -747,7 +828,7 @@ def cmd_plan(state: dict) -> None:
     for kp in kernels_plan:
         rank = kp.get("rank", "?")
         op_type = kp.get("op_type", "unknown")
-        shape = kp.get("shape", "")
+        shape = kp.get("model_shape", kp.get("shape", ""))
         if isinstance(shape, dict):
             shape = ", ".join(f"{k}={v}" for k, v in shape.items())
         elif isinstance(shape, list):
@@ -760,7 +841,8 @@ def cmd_plan(state: dict) -> None:
         sk = state_by_file.get(file_key) or state_by_file.get(Path(file_key).name) if file_key else None
 
         status = sk["status"].upper() if sk else "UNKNOWN"
-        speedup_str = f"{sk['speedup']:.2f}x" if sk and sk.get("speedup") else "--"
+        speedup = (sk.get("end_to_end_speedup") or sk.get("speedup")) if sk else None
+        speedup_str = f"{speedup:.2f}x" if speedup else "--"
 
         # Truncate shape for display
         shape_disp = shape[:28] + ".." if len(str(shape)) > 30 else str(shape)
@@ -807,9 +889,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     rec = sub.add_parser("record", help="Record an experiment result")
     rec.add_argument("kernel_file", help="Kernel file path (e.g. workspace/kernel_matmul_1.py)")
-    rec.add_argument("throughput_tflops", type=float, help="Throughput in TFLOPS")
+    rec.add_argument("metric_value", type=float, help="Metric value for this experiment")
     rec.add_argument("status", help="Experiment status: kept | revert | failed | crash | timeout")
     rec.add_argument("description", help="Brief description of the experiment")
+    rec.add_argument(
+        "--metric-name",
+        choices=("throughput_tflops", "recognizer_latency_ms"),
+        default="throughput_tflops",
+        help="Primary metric represented by metric_value",
+    )
 
     sub.add_parser("report", help="Generate aggregate optimization report")
     sub.add_parser("plan", help="Show optimization plan with Amdahl's law analysis")
@@ -828,7 +916,14 @@ def main() -> None:
     elif args.command == "next":
         cmd_next(state)
     elif args.command == "record":
-        cmd_record(state, args.kernel_file, args.throughput_tflops, args.status, args.description)
+        cmd_record(
+            state,
+            args.kernel_file,
+            args.metric_value,
+            args.status,
+            args.description,
+            metric_name=args.metric_name,
+        )
     elif args.command == "report":
         cmd_report(state)
     elif args.command == "plan":

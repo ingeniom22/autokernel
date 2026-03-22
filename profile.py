@@ -61,6 +61,20 @@ _KERNEL_CLASSIFICATION: List[Tuple[List[str], str]] = [
         ],
         "conv2d",
     ),
+    (["batch_norm", "batchnorm", "native_batch_norm", "invstd"], "batchnorm"),
+    (
+        [
+            "nchwtonhwc",
+            "nhwctonchw",
+            "layout",
+            "permute",
+            "transpose",
+            "reorder",
+            "direct_copy",
+            "contiguous",
+        ],
+        "layout_transform",
+    ),
     (["softmax"],                              "softmax"),
     (["layer_norm", "layernorm"],              "layernorm"),
     (["rms_norm", "rmsnorm"],                  "rmsnorm"),
@@ -477,6 +491,16 @@ def classify_kernel(kernel_name: str) -> str:
     ):
         return "matmul"
 
+    if "batch_norm" in name_lower or "batchnorm" in name_lower:
+        return "batchnorm"
+    if (
+        "nchwtonhwc" in name_lower
+        or "nhwctonchw" in name_lower
+        or "direct_copy" in name_lower
+        or "contiguous" in name_lower
+    ):
+        return "layout_transform"
+
     for fragments, op_type in _KERNEL_CLASSIFICATION:
         for frag in fragments:
             if frag in name_lower:
@@ -516,9 +540,19 @@ def estimate_roofline_position(
     gpu: GPUSpec,
 ) -> str:
     """Rough heuristic: is this kernel compute-bound or memory-bound?"""
-    compute_bound_ops = {"matmul", "flash_attention"}
-    memory_bound_ops = {"softmax", "layernorm", "rmsnorm", "reduce", "rotary_embedding",
-                        "fused_mlp", "cross_entropy"}
+    compute_bound_ops = {"matmul", "flash_attention", "conv2d", "depthwise_conv2d", "conv_transpose2d"}
+    memory_bound_ops = {
+        "softmax",
+        "layernorm",
+        "rmsnorm",
+        "batchnorm",
+        "reduce",
+        "rotary_embedding",
+        "fused_mlp",
+        "cross_entropy",
+        "layout_transform",
+        "interpolate",
+    }
 
     if op_type in compute_bound_ops:
         return "compute-bound"

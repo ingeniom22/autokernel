@@ -42,6 +42,9 @@ SHAPE_KEYS: Dict[str, List[str]] = {
     "flash_attention":   ["B", "H", "N", "D"],
     "layernorm":         ["M", "N"],
     "softmax":           ["M", "N"],
+    "conv2d":            ["N", "C_in", "C_out", "H", "W", "KH", "KW"],
+    "batchnorm":         ["N", "C", "H", "W"],
+    "layout_transform":  ["N", "C", "H", "W"],
     "cross_entropy":     ["batch", "vocab"],
     "fused_mlp":         ["M", "N", "K"],
     "rmsnorm":           ["M", "N"],
@@ -63,6 +66,30 @@ SHAPE_ALIAS_MAP: Dict[str, Dict[str, str]] = {
     },
     "softmax": {
         "M": "rows", "N": "cols", "rows": "rows", "cols": "cols",
+    },
+    "conv2d": {
+        "N": "N",
+        "C": "C_in",
+        "Cin": "C_in",
+        "C_in": "C_in",
+        "Cout": "C_out",
+        "C_out": "C_out",
+        "H": "H",
+        "W": "W",
+        "KH": "KH",
+        "KW": "KW",
+    },
+    "batchnorm": {
+        "N": "N",
+        "C": "C",
+        "H": "H",
+        "W": "W",
+    },
+    "layout_transform": {
+        "N": "N",
+        "C": "C",
+        "H": "H",
+        "W": "W",
     },
     "cross_entropy": {
         "batch": "batch", "vocab": "vocab",
@@ -105,6 +132,21 @@ TOLERANCES_MAP: Dict[str, Dict[str, Dict[str, float]]] = {
         "bfloat16": {"atol": 2e-3, "rtol": 2e-3},
         "float32":  {"atol": 1e-5, "rtol": 1e-5},
     },
+    "conv2d": {
+        "float16":  {"atol": 1e-2, "rtol": 1e-2},
+        "bfloat16": {"atol": 2e-2, "rtol": 2e-2},
+        "float32":  {"atol": 1e-4, "rtol": 1e-4},
+    },
+    "batchnorm": {
+        "float16":  {"atol": 1e-3, "rtol": 1e-3},
+        "bfloat16": {"atol": 2e-3, "rtol": 2e-3},
+        "float32":  {"atol": 1e-5, "rtol": 1e-5},
+    },
+    "layout_transform": {
+        "float16":  {"atol": 0.0, "rtol": 0.0},
+        "bfloat16": {"atol": 0.0, "rtol": 0.0},
+        "float32":  {"atol": 0.0, "rtol": 0.0},
+    },
     "cross_entropy": {
         "float16":  {"atol": 1e-2, "rtol": 1e-2},
         "bfloat16": {"atol": 2e-2, "rtol": 2e-2},
@@ -136,6 +178,9 @@ FLOPS_FN_SRC: Dict[str, str] = {
     "flash_attention":  'return 4 * s["batch"] * s["heads"] * (s["seq_len"] ** 2) * s["head_dim"]',
     "layernorm":        'return 8 * s["batch"] * s["dim"]',
     "softmax":          'return 5 * s["rows"] * s["cols"]',
+    "conv2d":           'return 2 * s["N"] * s["C_out"] * (((s["H"] + 2 * s["pad_h"] - s["dil_h"] * (s["KH"] - 1) - 1) // s["stride_h"]) + 1) * (((s["W"] + 2 * s["pad_w"] - s["dil_w"] * (s["KW"] - 1) - 1) // s["stride_w"]) + 1) * (s["C_in"] // s["groups"]) * s["KH"] * s["KW"]',
+    "batchnorm":        'return 4 * s["N"] * s["C"] * s["H"] * s["W"]',
+    "layout_transform": 'return s["N"] * s["C"] * s["H"] * s["W"]',
     "cross_entropy":    'return 4 * s["batch"] * s["vocab"]',
     "fused_mlp":        'return 2 * s["batch"] * s["dim"] * s["hidden"] * 3',
     "rmsnorm":          'return 6 * s["M"] * s["N"]',
@@ -149,6 +194,9 @@ BYTES_FN_SRC: Dict[str, str] = {
     "flash_attention":  'return 4 * s["batch"] * s["heads"] * s["seq_len"] * s["head_dim"] * dt_bytes',
     "layernorm":        'return (2 * s["batch"] * s["dim"] + 2 * s["dim"]) * dt_bytes',
     "softmax":          'return 2 * s["rows"] * s["cols"] * dt_bytes',
+    "conv2d":           'return (s["N"] * s["C_in"] * s["H"] * s["W"] + s["C_out"] * (s["C_in"] // s["groups"]) * s["KH"] * s["KW"] + s["N"] * s["C_out"] * (((s["H"] + 2 * s["pad_h"] - s["dil_h"] * (s["KH"] - 1) - 1) // s["stride_h"]) + 1) * (((s["W"] + 2 * s["pad_w"] - s["dil_w"] * (s["KW"] - 1) - 1) // s["stride_w"]) + 1)) * dt_bytes',
+    "batchnorm":        'return (3 * s["N"] * s["C"] * s["H"] * s["W"] + 4 * s["C"]) * dt_bytes',
+    "layout_transform": 'return 2 * s["N"] * s["C"] * s["H"] * s["W"] * dt_bytes',
     "cross_entropy":    'return (s["batch"] * s["vocab"] + s["batch"]) * dt_bytes',
     "fused_mlp":        'return (s["batch"] * s["dim"] + s["hidden"] * s["dim"] * 3 + s["batch"] * s["dim"]) * dt_bytes',
     "rmsnorm":          'return (2 * s["M"] * s["N"] + s["N"]) * dt_bytes',
@@ -162,6 +210,9 @@ SPEEDUP_ESTIMATES: Dict[str, str] = {
     "flash_attention":  "2-4x",
     "layernorm":        "1.5-3x",
     "softmax":          "1.5-3x",
+    "conv2d":           "1.2-2x",
+    "batchnorm":        "1.2-1.8x",
+    "layout_transform": "1.1-1.5x",
     "cross_entropy":    "1.5-2x",
     "fused_mlp":        "2-3x",
     "rmsnorm":          "1.5-3x",
@@ -269,6 +320,63 @@ def _parse_profiler_shape_list(shape_info_str: str, op_type: str) -> Optional[Di
             }
         return None
 
+    if op_type == "conv2d":
+        if len(shapes) >= 2 and len(shapes[0]) == 4 and len(shapes[1]) == 4:
+            n, c_in, h, w = shapes[0]
+            c_out, weight_c_in, kh, kw = shapes[1]
+            groups = max(1, c_in // max(weight_c_in, 1))
+            return {
+                "N": n,
+                "C_in": c_in,
+                "C_out": c_out,
+                "H": h,
+                "W": w,
+                "KH": kh,
+                "KW": kw,
+                "stride_h": 1,
+                "stride_w": 1,
+                "pad_h": kh // 2,
+                "pad_w": kw // 2,
+                "dil_h": 1,
+                "dil_w": 1,
+                "groups": groups,
+            }
+        return None
+
+    if op_type == "batchnorm":
+        if shapes and len(shapes[0]) >= 2:
+            input_shape = shapes[0]
+            if len(input_shape) == 4:
+                n, c, h, w = input_shape
+            elif len(input_shape) == 3:
+                n, c, w = input_shape
+                h = 1
+            elif len(input_shape) == 2:
+                n, c = input_shape
+                h = 1
+                w = 1
+            else:
+                return None
+            return {"N": n, "C": c, "H": h, "W": w}
+        return None
+
+    if op_type == "layout_transform":
+        if shapes and len(shapes[0]) >= 2:
+            input_shape = shapes[0]
+            if len(input_shape) == 4:
+                n, c, h, w = input_shape
+            elif len(input_shape) == 3:
+                n, c, w = input_shape
+                h = 1
+            elif len(input_shape) == 2:
+                n, w = input_shape
+                c = 1
+                h = 1
+            else:
+                return None
+            return {"N": n, "C": c, "H": h, "W": w}
+        return None
+
     return None
 
 
@@ -298,6 +406,35 @@ def scale_shape(shape: Dict[str, int], factor: float) -> Dict[str, int]:
     return {k: max(1, int(round(v * factor))) for k, v in shape.items()}
 
 
+def scale_shape_for_op(op_type: str, shape: Dict[str, int], factor: float) -> Dict[str, int]:
+    """Scale shapes with light op-specific rules to keep generated tests valid."""
+    if op_type != "conv2d":
+        return scale_shape(shape, factor)
+
+    scaled = dict(shape)
+    for key in ("N", "C_in", "C_out", "H", "W"):
+        if key in scaled:
+            scaled[key] = max(1, int(round(shape[key] * factor)))
+
+    # Kernel geometry and convolution hyperparameters should stay stable.
+    for key in ("KH", "KW", "stride_h", "stride_w", "pad_h", "pad_w", "dil_h", "dil_w"):
+        if key in shape:
+            scaled[key] = shape[key]
+
+    groups = shape.get("groups", 1)
+    if groups <= 1:
+        scaled["groups"] = 1
+    elif groups == shape.get("C_in", 1) and shape.get("C_out") == shape.get("C_in"):
+        scaled["C_out"] = scaled["C_in"]
+        scaled["groups"] = scaled["C_in"]
+    elif scaled["C_in"] % groups == 0 and scaled["C_out"] % groups == 0:
+        scaled["groups"] = groups
+    else:
+        scaled["groups"] = 1
+
+    return scaled
+
+
 def get_default_shape(op_type: str) -> Dict[str, int]:
     """
     Return a reasonable default shape for a given op_type when parsing fails.
@@ -308,6 +445,9 @@ def get_default_shape(op_type: str) -> Dict[str, int]:
         "flash_attention":  {"batch": 2, "heads": 32, "seq_len": 1024, "head_dim": 64},
         "layernorm":        {"batch": 4096, "dim": 2048},
         "softmax":          {"rows": 4096, "cols": 4096},
+        "conv2d":           {"N": 1, "C_in": 64, "C_out": 64, "H": 48, "W": 320, "KH": 3, "KW": 3, "stride_h": 1, "stride_w": 1, "pad_h": 1, "pad_w": 1, "dil_h": 1, "dil_w": 1, "groups": 1},
+        "batchnorm":        {"N": 1, "C": 192, "H": 6, "W": 80},
+        "layout_transform": {"N": 1, "C": 192, "H": 6, "W": 80},
         "cross_entropy":    {"batch": 4096, "vocab": 32000},
         "fused_mlp":        {"batch": 2048, "dim": 2048, "hidden": 5504},
         "rmsnorm":          {"M": 4096, "N": 4096},
@@ -377,8 +517,8 @@ def generate_kernel_file(
 ) -> str:
     """Generate the complete kernel file content for extraction."""
 
-    half_shape = scale_shape(model_shape, 0.5)
-    double_shape = scale_shape(model_shape, 2.0)
+    half_shape = scale_shape_for_op(op_type, model_shape, 0.5)
+    double_shape = scale_shape_for_op(op_type, model_shape, 2.0)
 
     shape_display = shape_to_display(model_shape)
     half_display = shape_to_display(half_shape)
@@ -407,7 +547,7 @@ def generate_kernel_file(
     lines.append(f"Model shape: {shape_display}")
     lines.append(f"")
     lines.append(f"This kernel was extracted from profiling {model_name}.")
-    lines.append(f"The agent optimizes this to maximize throughput at the model-specific shapes.")
+    lines.append(f"The agent optimizes this only if it improves model latency at the model-specific shapes.")
     lines.append('"""')
     lines.append("")
 
@@ -543,6 +683,12 @@ def generate_optimization_plan(
         })
 
     return {
+        "primary_metric": "recognizer_latency_ms",
+        "latency_scope": "ppocr_recognizer",
+        "acceptance_policy": (
+            "Keep kernel candidates only when correctness passes and end-to-end "
+            "PPOCRv5ServerRecModel latency improves."
+        ),
         "kernels_to_optimize": kernels_to_optimize,
         "total_optimization_targets": len(kernels_to_optimize),
         "covered_gpu_time_pct": round(total_pct, 1),

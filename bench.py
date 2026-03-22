@@ -215,6 +215,64 @@ def gen_softmax_inputs(size: dict, dtype: torch.dtype, device: str, seed: int = 
     return {"x": x}
 
 
+def gen_conv2d_inputs(size: dict, dtype: torch.dtype, device: str, seed: int = 42) -> dict:
+    torch.manual_seed(seed)
+    n = size["N"]
+    c_in = size["C_in"]
+    c_out = size["C_out"]
+    h = size["H"]
+    w = size["W"]
+    kh = size["KH"]
+    kw = size["KW"]
+    groups = size.get("groups", 1)
+    stride = (size.get("stride_h", 1), size.get("stride_w", 1))
+    padding = (size.get("pad_h", 0), size.get("pad_w", 0))
+    dilation = (size.get("dil_h", 1), size.get("dil_w", 1))
+    x = torch.randn(n, c_in, h, w, device=device, dtype=dtype)
+    weight = torch.randn(c_out, c_in // groups, kh, kw, device=device, dtype=dtype) * 0.02
+    bias = torch.randn(c_out, device=device, dtype=dtype) * 0.02
+    return {
+        "x": x,
+        "weight": weight,
+        "bias": bias,
+        "stride": stride,
+        "padding": padding,
+        "dilation": dilation,
+        "groups": groups,
+    }
+
+
+def gen_batchnorm_inputs(size: dict, dtype: torch.dtype, device: str, seed: int = 42) -> dict:
+    torch.manual_seed(seed)
+    n = size["N"]
+    c = size["C"]
+    h = size["H"]
+    w = size["W"]
+    x = torch.randn(n, c, h, w, device=device, dtype=dtype)
+    weight = torch.randn(c, device=device, dtype=dtype) * 0.1 + 1.0
+    bias = torch.randn(c, device=device, dtype=dtype) * 0.02
+    running_mean = torch.randn(c, device=device, dtype=torch.float32) * 0.05
+    running_var = torch.rand(c, device=device, dtype=torch.float32) + 0.5
+    return {
+        "x": x,
+        "weight": weight,
+        "bias": bias,
+        "running_mean": running_mean,
+        "running_var": running_var,
+        "eps": 1e-5,
+    }
+
+
+def gen_layout_transform_inputs(size: dict, dtype: torch.dtype, device: str, seed: int = 42) -> dict:
+    torch.manual_seed(seed)
+    n = size["N"]
+    c = size["C"]
+    h = size["H"]
+    w = size["W"]
+    x = torch.randn(n, c, h, w, device=device, dtype=dtype)
+    return {"x": x}
+
+
 def gen_layernorm_inputs(size: dict, dtype: torch.dtype, device: str, seed: int = 42) -> dict:
     torch.manual_seed(seed)
     batch, dim = size["batch"], size["dim"]
@@ -288,6 +346,31 @@ def _ref_matmul(inputs: dict) -> torch.Tensor:
 def _ref_softmax(inputs: dict) -> torch.Tensor:
     import reference
     return reference.softmax_ref(inputs["x"])
+
+def _ref_conv2d(inputs: dict) -> torch.Tensor:
+    return F.conv2d(
+        inputs["x"],
+        inputs["weight"],
+        inputs.get("bias"),
+        stride=inputs.get("stride", 1),
+        padding=inputs.get("padding", 0),
+        dilation=inputs.get("dilation", 1),
+        groups=inputs.get("groups", 1),
+    )
+
+def _ref_batchnorm(inputs: dict) -> torch.Tensor:
+    return F.batch_norm(
+        inputs["x"],
+        inputs["running_mean"],
+        inputs["running_var"],
+        inputs["weight"],
+        inputs["bias"],
+        training=False,
+        eps=inputs.get("eps", 1e-5),
+    )
+
+def _ref_layout_transform(inputs: dict) -> torch.Tensor:
+    return inputs["x"].contiguous(memory_format=torch.channels_last)
 
 def _ref_layernorm(inputs: dict) -> torch.Tensor:
     import reference
@@ -389,6 +472,101 @@ KERNEL_CONFIGS: Dict[str, Dict[str, Any]] = {
             ("edge_1023",  {"rows": 1023, "cols": 1023}),
             ("edge_4097",  {"rows": 4097, "cols": 4097}),
             ("edge_50257", {"rows": 1024, "cols": 50257}),
+        ],
+    },
+
+    # -----------------------------------------------------------------
+    # CONV2D
+    # -----------------------------------------------------------------
+    "conv2d": {
+        "test_sizes": [
+            ("tiny",   {"N": 1, "C_in": 32, "C_out": 32, "H": 16, "W": 16, "KH": 3, "KW": 3, "stride_h": 1, "stride_w": 1, "pad_h": 1, "pad_w": 1, "dil_h": 1, "dil_w": 1, "groups": 1}),
+            ("small",  {"N": 1, "C_in": 64, "C_out": 64, "H": 32, "W": 32, "KH": 3, "KW": 3, "stride_h": 1, "stride_w": 1, "pad_h": 1, "pad_w": 1, "dil_h": 1, "dil_w": 1, "groups": 1}),
+            ("medium", {"N": 1, "C_in": 192, "C_out": 192, "H": 6, "W": 80, "KH": 1, "KW": 1, "stride_h": 1, "stride_w": 1, "pad_h": 0, "pad_w": 0, "dil_h": 1, "dil_w": 1, "groups": 1}),
+            ("large",  {"N": 1, "C_in": 256, "C_out": 256, "H": 1, "W": 40, "KH": 3, "KW": 3, "stride_h": 1, "stride_w": 1, "pad_h": 1, "pad_w": 1, "dil_h": 1, "dil_w": 1, "groups": 1}),
+            ("depthwise", {"N": 1, "C_in": 192, "C_out": 192, "H": 6, "W": 80, "KH": 3, "KW": 3, "stride_h": 1, "stride_w": 1, "pad_h": 1, "pad_w": 1, "dil_h": 1, "dil_w": 1, "groups": 192}),
+        ],
+        "test_dtypes": [torch.float16, torch.bfloat16, torch.float32],
+        "tolerances": {
+            torch.float16:  {"atol": 1e-2, "rtol": 1e-2},
+            torch.bfloat16: {"atol": 2e-2, "rtol": 2e-2},
+            torch.float32:  {"atol": 1e-4, "rtol": 1e-4},
+        },
+        "flops_fn": lambda s: 2
+        * s["N"]
+        * s["C_out"]
+        * (((s["H"] + 2 * s["pad_h"] - s["dil_h"] * (s["KH"] - 1) - 1) // s["stride_h"]) + 1)
+        * (((s["W"] + 2 * s["pad_w"] - s["dil_w"] * (s["KW"] - 1) - 1) // s["stride_w"]) + 1)
+        * (s["C_in"] // s["groups"])
+        * s["KH"]
+        * s["KW"],
+        "bytes_fn": lambda s, dt: (
+            s["N"] * s["C_in"] * s["H"] * s["W"]
+            + s["C_out"] * (s["C_in"] // s["groups"]) * s["KH"] * s["KW"]
+            + s["N"]
+            * s["C_out"]
+            * (((s["H"] + 2 * s["pad_h"] - s["dil_h"] * (s["KH"] - 1) - 1) // s["stride_h"]) + 1)
+            * (((s["W"] + 2 * s["pad_w"] - s["dil_w"] * (s["KW"] - 1) - 1) // s["stride_w"]) + 1)
+        ) * _dtype_bytes(dt),
+        "input_generator": gen_conv2d_inputs,
+        "reference_fn": _ref_conv2d,
+        "edge_sizes": [
+            ("edge_odd", {"N": 1, "C_in": 48, "C_out": 80, "H": 15, "W": 37, "KH": 3, "KW": 3, "stride_h": 1, "stride_w": 1, "pad_h": 1, "pad_w": 1, "dil_h": 1, "dil_w": 1, "groups": 1}),
+            ("edge_stride2", {"N": 1, "C_in": 64, "C_out": 96, "H": 31, "W": 63, "KH": 3, "KW": 3, "stride_h": 2, "stride_w": 2, "pad_h": 1, "pad_w": 1, "dil_h": 1, "dil_w": 1, "groups": 1}),
+        ],
+    },
+
+    # -----------------------------------------------------------------
+    # BATCHNORM
+    # -----------------------------------------------------------------
+    "batchnorm": {
+        "test_sizes": [
+            ("tiny",   {"N": 1, "C": 32, "H": 16, "W": 16}),
+            ("small",  {"N": 1, "C": 64, "H": 32, "W": 32}),
+            ("medium", {"N": 1, "C": 192, "H": 6, "W": 80}),
+            ("large",  {"N": 1, "C": 256, "H": 1, "W": 40}),
+            ("wide",   {"N": 1, "C": 512, "H": 8, "W": 160}),
+        ],
+        "test_dtypes": [torch.float16, torch.bfloat16, torch.float32],
+        "tolerances": {
+            torch.float16:  {"atol": 1e-3, "rtol": 1e-3},
+            torch.bfloat16: {"atol": 2e-3, "rtol": 2e-3},
+            torch.float32:  {"atol": 1e-5, "rtol": 1e-5},
+        },
+        "flops_fn": lambda s: 4 * s["N"] * s["C"] * s["H"] * s["W"],
+        "bytes_fn": lambda s, dt: (3 * s["N"] * s["C"] * s["H"] * s["W"] + 4 * s["C"]) * _dtype_bytes(dt),
+        "input_generator": gen_batchnorm_inputs,
+        "reference_fn": _ref_batchnorm,
+        "edge_sizes": [
+            ("edge_odd", {"N": 1, "C": 48, "H": 15, "W": 37}),
+            ("edge_skinny", {"N": 1, "C": 256, "H": 1, "W": 127}),
+        ],
+    },
+
+    # -----------------------------------------------------------------
+    # LAYOUT TRANSFORM
+    # -----------------------------------------------------------------
+    "layout_transform": {
+        "test_sizes": [
+            ("tiny",   {"N": 1, "C": 32, "H": 16, "W": 16}),
+            ("small",  {"N": 1, "C": 64, "H": 32, "W": 32}),
+            ("medium", {"N": 1, "C": 192, "H": 6, "W": 80}),
+            ("large",  {"N": 1, "C": 256, "H": 1, "W": 40}),
+            ("xlarge", {"N": 1, "C": 512, "H": 8, "W": 320}),
+        ],
+        "test_dtypes": [torch.float16, torch.bfloat16, torch.float32],
+        "tolerances": {
+            torch.float16:  {"atol": 0.0, "rtol": 0.0},
+            torch.bfloat16: {"atol": 0.0, "rtol": 0.0},
+            torch.float32:  {"atol": 0.0, "rtol": 0.0},
+        },
+        "flops_fn": lambda s: s["N"] * s["C"] * s["H"] * s["W"],
+        "bytes_fn": lambda s, dt: 2 * s["N"] * s["C"] * s["H"] * s["W"] * _dtype_bytes(dt),
+        "input_generator": gen_layout_transform_inputs,
+        "reference_fn": _ref_layout_transform,
+        "edge_sizes": [
+            ("edge_odd", {"N": 1, "C": 48, "H": 15, "W": 37}),
+            ("edge_tall", {"N": 1, "C": 64, "H": 3, "W": 257}),
         ],
     },
 

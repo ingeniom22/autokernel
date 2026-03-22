@@ -25,7 +25,6 @@ import inspect
 import json
 import os
 import sys
-import sysconfig
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -75,15 +74,6 @@ class KernelReplacement:
     generic_fallback: bool = False
     fuse_batchnorm_act: bool = False
     global_channels_last: bool = False
-    global_cuda_graph: bool = False
-    cuda_graph_warmup_iters: int = 3
-    cuda_graph_input_mode: str = "clone"
-    cuda_graph_output_mode: str = "clone"
-    block_fusion_kind: Optional[str] = None
-    target_modules: Optional[List[str]] = None
-    torch_compile_backend: Optional[str] = None
-    torch_compile_mode: Optional[str] = None
-    torch_compile_options: Optional[Dict[str, Any]] = None
     verify_atol: Optional[float] = None
     verify_rtol: Optional[float] = None
     status: Optional[str] = None
@@ -121,32 +111,6 @@ class VerificationResult:
 # ---------------------------------------------------------------------------
 # 1. Model Loading
 # ---------------------------------------------------------------------------
-
-def _ensure_stdlib_profile_module_for_compile() -> None:
-    """
-    Avoid local `autokernel/profile.py` shadowing stdlib `profile` during torch.compile.
-
-    TorchDynamo/Inductor imports `cProfile`, which imports `profile`. When the current
-    working directory is the autokernel root, Python can resolve the local file instead
-    of the stdlib module and fail before compilation starts.
-    """
-    current = sys.modules.get("profile")
-    current_file = getattr(current, "__file__", "")
-    local_profile = Path(SCRIPT_DIR) / "profile.py"
-    if current is not None and current_file:
-        resolved = Path(current_file).resolve()
-        if resolved == local_profile.resolve():
-            del sys.modules["profile"]
-            current = None
-
-    if current is None:
-        stdlib_profile = Path(sysconfig.get_path("stdlib")) / "profile.py"
-        spec = importlib.util.spec_from_file_location("profile", stdlib_profile)
-        if spec is None or spec.loader is None:
-            raise ImportError(f"Could not load stdlib profile module from {stdlib_profile}")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        sys.modules["profile"] = module
 
 def load_model_from_file(model_path: str, class_name: str, **kwargs) -> nn.Module:
     """Load a model from a Python file by importing it and instantiating the class."""
@@ -405,10 +369,9 @@ def discover_optimized_kernels() -> List[KernelReplacement]:
 
             state_known_paths.add(os.path.abspath(opt_path))
 
-            status = str(k.get("status", "")).strip().lower()
             include_candidate = os.path.exists(opt_path) and (
-                status in {"done", "optimizing"}
-                or (not status and speedup is not None and speedup > 1.0)
+                (speedup is not None and speedup > 1.0)
+                or k.get("status") == "optimizing"
             )
 
             if include_candidate:
@@ -473,19 +436,11 @@ def load_kernel_module(path: str) -> Any:
     """Dynamically import a kernel .py file and return the module."""
     path = os.path.abspath(path)
     module_name = f"opt_kernel_{os.path.basename(path).replace('.py', '')}"
-    cached = sys.modules.get(module_name)
-    if cached is not None:
-        return cached
     spec = importlib.util.spec_from_file_location(module_name, path)
     if spec is None or spec.loader is None:
         raise ImportError(f"Cannot load kernel from: {path}")
     mod = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = mod
-    try:
-        spec.loader.exec_module(mod)
-    except Exception:
-        sys.modules.pop(module_name, None)
-        raise
+    spec.loader.exec_module(mod)
     return mod
 
 
@@ -590,7 +545,6 @@ class _ConvBnActFusedWrapper(nn.Module):
         self.dilation = conv.dilation
         self.groups = conv.groups
         self.act = act
-        self._use_inplace_relu = isinstance(act, nn.ReLU)
 
         with torch.no_grad():
             weight_fp32 = conv.weight.detach().float()
@@ -609,7 +563,7 @@ class _ConvBnActFusedWrapper(nn.Module):
 
         self.register_buffer(
             "folded_weight",
-            folded_weight.to(dtype=conv.weight.dtype).contiguous(memory_format=torch.channels_last),
+            folded_weight.to(dtype=conv.weight.dtype).contiguous(),
             persistent=False,
         )
         self.register_buffer(
@@ -630,517 +584,7 @@ class _ConvBnActFusedWrapper(nn.Module):
             dilation=self.dilation,
             groups=self.groups,
         )
-        if self._use_inplace_relu:
-            return torch.relu_(y)
         return self.act(y)
-
-
-def _extract_folded_conv_like(
-    module: nn.Module,
-) -> Tuple[torch.Tensor, torch.Tensor, Any, Any, Any, int, bool, Optional[nn.Module]]:
-    if hasattr(module, "folded_weight") and hasattr(module, "folded_bias"):
-        return (
-            module.folded_weight.detach(),
-            module.folded_bias.detach(),
-            getattr(module, "stride"),
-            getattr(module, "padding"),
-            getattr(module, "dilation"),
-            int(getattr(module, "groups")),
-            bool(getattr(module, "_use_inplace_relu", False) or isinstance(getattr(module, "act", None), nn.ReLU)),
-            getattr(module, "act", None) if isinstance(getattr(module, "act", None), nn.Module) else None,
-        )
-
-    conv = getattr(module, "conv", None)
-    bn = getattr(module, "bn", None) or getattr(module, "norm", None)
-    if not isinstance(conv, nn.Conv2d) or not isinstance(bn, nn.BatchNorm2d):
-        raise TypeError(f"Unsupported conv-like module for block fusion: {type(module).__name__}")
-
-    with torch.no_grad():
-        weight_fp32 = conv.weight.detach().float()
-        conv_bias_fp32 = (
-            conv.bias.detach().float()
-            if conv.bias is not None
-            else torch.zeros(conv.out_channels, device=weight_fp32.device, dtype=torch.float32)
-        )
-        bn_weight_fp32 = bn.weight.detach().float()
-        bn_bias_fp32 = bn.bias.detach().float()
-        running_mean_fp32 = bn.running_mean.detach().float()
-        running_var_fp32 = bn.running_var.detach().float()
-        scale_fp32 = bn_weight_fp32 / torch.sqrt(running_var_fp32 + bn.eps)
-        folded_weight = weight_fp32 * scale_fp32.reshape(-1, 1, 1, 1)
-        folded_bias = bn_bias_fp32 + (conv_bias_fp32 - running_mean_fp32) * scale_fp32
-
-    act = getattr(module, "act", None)
-    return (
-        folded_weight.to(dtype=conv.weight.dtype).contiguous(memory_format=torch.channels_last),
-        folded_bias.to(dtype=conv.weight.dtype),
-        conv.stride,
-        conv.padding,
-        conv.dilation,
-        int(conv.groups),
-        bool(getattr(module, "_use_inplace_relu", False) or isinstance(act, nn.ReLU)),
-        act if isinstance(act, nn.Module) else None,
-    )
-
-
-class _FoldedConvLikeWrapper(nn.Module):
-    """Inference wrapper that folds Conv+BatchNorm and preserves the activation."""
-
-    def __init__(self, module: nn.Module):
-        super().__init__()
-        weight, bias, stride, padding, dilation, groups, use_inplace_relu, act = _extract_folded_conv_like(module)
-        self.register_buffer("weight", weight.contiguous(memory_format=torch.channels_last), persistent=False)
-        self.register_buffer("bias", bias, persistent=False)
-        self.stride = stride
-        self.padding = padding
-        self.dilation = dilation
-        self.groups = groups
-        self._use_inplace_relu = use_inplace_relu
-        self.act = act
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.ndim == 4 and not x.is_contiguous(memory_format=torch.channels_last):
-            x = x.contiguous(memory_format=torch.channels_last)
-        y = F.conv2d(
-            x,
-            self.weight,
-            self.bias,
-            stride=self.stride,
-            padding=self.padding,
-            dilation=self.dilation,
-            groups=self.groups,
-        )
-        if self._use_inplace_relu:
-            return torch.relu_(y)
-        if self.act is not None:
-            return self.act(y)
-        return y
-
-
-def _apply_folded_conv_like_activation(module: _FoldedConvLikeWrapper, y: torch.Tensor) -> torch.Tensor:
-    if getattr(module, "_use_inplace_relu", False):
-        return torch.relu_(y)
-    act = getattr(module, "act", None)
-    if act is not None:
-        return act(y)
-    return y
-
-
-class _FoldedLightConvWrapper(nn.Module):
-    """Inference wrapper for PP-HGNetV2 LightConvBNAct blocks."""
-
-    def __init__(self, module: nn.Module):
-        super().__init__()
-        self.conv1 = _FoldedConvLikeWrapper(getattr(module, "conv1"))
-        self.conv2 = _FoldedConvLikeWrapper(getattr(module, "conv2"))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.conv2(self.conv1(x))
-
-
-class _HGV2BlockFusedWrapper(nn.Module):
-    """Inference-only PP-HGNetV2 block wrapper with all ConvBNAct pairs folded."""
-
-    def __init__(self, module: nn.Module):
-        super().__init__()
-        self.identity = bool(getattr(module, "identity", False))
-        layers = []
-        for layer in getattr(module, "layers"):
-            if hasattr(layer, "conv1") and hasattr(layer, "conv2"):
-                layers.append(_FoldedLightConvWrapper(layer))
-            else:
-                layers.append(_FoldedConvLikeWrapper(layer))
-        self.layers = nn.ModuleList(layers)
-        self.aggregation_squeeze_conv = _FoldedConvLikeWrapper(
-            getattr(module, "aggregation_squeeze_conv")
-        )
-        self.aggregation_excitation_conv = _FoldedConvLikeWrapper(
-            getattr(module, "aggregation_excitation_conv")
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        identity = x
-        outputs = [x]
-        for layer in self.layers:
-            x = layer(x)
-            outputs.append(x)
-        x = torch.cat(outputs, dim=1)
-        x = self.aggregation_squeeze_conv(x)
-        x = self.aggregation_excitation_conv(x)
-        if self.identity:
-            x = x + identity
-        return x
-
-
-class _HGV2BlockPreallocCatWrapper(nn.Module):
-    """Inference-only PP-HGNetV2 block wrapper that preallocates the concat buffer."""
-
-    def __init__(self, module: nn.Module):
-        super().__init__()
-        self.identity = bool(getattr(module, "identity", False))
-        layers = []
-        layer_out_channels: List[int] = []
-        for layer in getattr(module, "layers"):
-            if hasattr(layer, "conv1") and hasattr(layer, "conv2"):
-                wrapped = _FoldedLightConvWrapper(layer)
-                out_channels = int(wrapped.conv2.weight.shape[0])
-            else:
-                wrapped = _FoldedConvLikeWrapper(layer)
-                out_channels = int(wrapped.weight.shape[0])
-            layers.append(wrapped)
-            layer_out_channels.append(out_channels)
-        self.layers = nn.ModuleList(layers)
-        self.layer_out_channels = layer_out_channels
-        self.total_extra_channels = int(sum(layer_out_channels))
-        self.aggregation_squeeze_conv = _FoldedConvLikeWrapper(
-            getattr(module, "aggregation_squeeze_conv")
-        )
-        self.aggregation_excitation_conv = _FoldedConvLikeWrapper(
-            getattr(module, "aggregation_excitation_conv")
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        identity = x
-        n, c_in, h, w = x.shape
-        memory_format = (
-            torch.channels_last
-            if x.is_contiguous(memory_format=torch.channels_last)
-            else torch.contiguous_format
-        )
-        cat_buffer = torch.empty(
-            (n, c_in + self.total_extra_channels, h, w),
-            device=x.device,
-            dtype=x.dtype,
-            memory_format=memory_format,
-        )
-        cat_buffer[:, :c_in].copy_(x)
-
-        current = x
-        offset = c_in
-        for layer, out_channels in zip(self.layers, self.layer_out_channels):
-            current = layer(current)
-            cat_buffer[:, offset:offset + out_channels].copy_(current)
-            offset += out_channels
-
-        x = self.aggregation_squeeze_conv(cat_buffer)
-        x = self.aggregation_excitation_conv(x)
-        if self.identity:
-            x = x + identity
-        return x
-
-
-class _HGV2BlockSqueezeAccumulateWrapper(nn.Module):
-    """Inference-only PP-HGNetV2 block wrapper that removes the explicit concat before squeeze."""
-
-    def __init__(self, module: nn.Module):
-        super().__init__()
-        self.identity = bool(getattr(module, "identity", False))
-        layers = []
-        squeeze_input_channels: List[int] = []
-        for i, layer in enumerate(getattr(module, "layers")):
-            if hasattr(layer, "conv1") and hasattr(layer, "conv2"):
-                wrapped = _FoldedLightConvWrapper(layer)
-                if i == 0:
-                    squeeze_input_channels.append(int(wrapped.conv1.weight.shape[1]))
-                squeeze_input_channels.append(int(wrapped.conv2.weight.shape[0]))
-            else:
-                wrapped = _FoldedConvLikeWrapper(layer)
-                if i == 0:
-                    squeeze_input_channels.append(int(wrapped.weight.shape[1]))
-                squeeze_input_channels.append(int(wrapped.weight.shape[0]))
-            layers.append(wrapped)
-        self.layers = nn.ModuleList(layers)
-        self.squeeze_input_channels = squeeze_input_channels
-        self.aggregation_squeeze_conv = _FoldedConvLikeWrapper(
-            getattr(module, "aggregation_squeeze_conv")
-        )
-        self.aggregation_excitation_conv = _FoldedConvLikeWrapper(
-            getattr(module, "aggregation_excitation_conv")
-        )
-        if self.aggregation_squeeze_conv.groups != 1:
-            raise ValueError("Squeeze-accumulate wrapper only supports groups=1 squeeze convolutions")
-        if tuple(int(v) for v in self.aggregation_squeeze_conv.weight.shape[2:]) != (1, 1):
-            raise ValueError("Squeeze-accumulate wrapper only supports 1x1 squeeze convolutions")
-        expected_channels = int(self.aggregation_squeeze_conv.weight.shape[1])
-        if sum(self.squeeze_input_channels) != expected_channels:
-            raise ValueError(
-                "Squeeze-accumulate wrapper channel split does not match folded squeeze weight "
-                f"({sum(self.squeeze_input_channels)} != {expected_channels})"
-            )
-
-    def _apply_squeeze_accumulate(self, outputs: List[torch.Tensor]) -> torch.Tensor:
-        squeeze = self.aggregation_squeeze_conv
-        acc: Optional[torch.Tensor] = None
-        offset = 0
-        for value, channels in zip(outputs, self.squeeze_input_channels):
-            weight_slice = squeeze.weight[:, offset:offset + channels, :, :]
-            part = F.conv2d(
-                value,
-                weight_slice,
-                bias=None,
-                stride=squeeze.stride,
-                padding=squeeze.padding,
-                dilation=squeeze.dilation,
-                groups=1,
-            )
-            acc = part if acc is None else acc + part
-            offset += channels
-        if acc is None:
-            raise RuntimeError("Squeeze-accumulate wrapper received no block outputs")
-        acc = acc + squeeze.bias.view(1, -1, 1, 1)
-        return _apply_folded_conv_like_activation(squeeze, acc)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        identity = x
-        outputs = [x]
-        for layer in self.layers:
-            x = layer(x)
-            outputs.append(x)
-        x = self._apply_squeeze_accumulate(outputs)
-        x = self.aggregation_excitation_conv(x)
-        if self.identity:
-            x = x + identity
-        return x
-
-
-class _HGV2StageFusedWrapper(nn.Module):
-    """Inference-only PP-HGNetV2 stage wrapper that folds downsample and block internals."""
-
-    def __init__(self, module: nn.Module):
-        super().__init__()
-        self.is_downsample = bool(getattr(module, "is_downsample", False))
-        if self.is_downsample:
-            self.downsample = _FoldedConvLikeWrapper(getattr(module, "downsample"))
-        self.blocks = nn.Sequential(*[_HGV2BlockFusedWrapper(block) for block in getattr(module, "blocks")])
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.is_downsample:
-            x = self.downsample(x)
-        return self.blocks(x)
-
-
-class _HGV2StageSqueezeAccumulateWrapper(nn.Module):
-    """Inference-only PP-HGNetV2 stage wrapper with concat-free squeeze accumulation."""
-
-    def __init__(self, module: nn.Module):
-        super().__init__()
-        self.is_downsample = bool(getattr(module, "is_downsample", False))
-        if self.is_downsample:
-            self.downsample = _FoldedConvLikeWrapper(getattr(module, "downsample"))
-        self.blocks = nn.Sequential(
-            *[_HGV2BlockSqueezeAccumulateWrapper(block) for block in getattr(module, "blocks")]
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.is_downsample:
-            x = self.downsample(x)
-        return self.blocks(x)
-
-
-class _HGV2StagePreallocCatWrapper(nn.Module):
-    """Inference-only PP-HGNetV2 stage wrapper with preallocated block concatenations."""
-
-    def __init__(self, module: nn.Module):
-        super().__init__()
-        self.is_downsample = bool(getattr(module, "is_downsample", False))
-        if self.is_downsample:
-            self.downsample = _FoldedConvLikeWrapper(getattr(module, "downsample"))
-        self.blocks = nn.Sequential(*[_HGV2BlockPreallocCatWrapper(block) for block in getattr(module, "blocks")])
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.is_downsample:
-            x = self.downsample(x)
-        return self.blocks(x)
-
-
-class _HGV2StageBlocksOnlyWrapper(nn.Module):
-    """Keep the stage downsample exact but fold the inner HGV2 blocks."""
-
-    def __init__(self, module: nn.Module):
-        super().__init__()
-        self.is_downsample = bool(getattr(module, "is_downsample", False))
-        if self.is_downsample:
-            self.downsample = getattr(module, "downsample")
-        self.blocks = nn.Sequential(*[_HGV2BlockFusedWrapper(block) for block in getattr(module, "blocks")])
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.is_downsample:
-            x = self.downsample(x)
-        return self.blocks(x)
-
-
-class _StemBlockFusedWrapper(nn.Module):
-    """Inference-only PP-HGNetV2 stem wrapper with ConvBNAct pairs folded."""
-
-    def __init__(self, module: nn.Module):
-        super().__init__()
-        self.stem1 = _FoldedConvLikeWrapper(getattr(module, "stem1"))
-        self.stem2a = _FoldedConvLikeWrapper(getattr(module, "stem2a"))
-        self.stem2b = _FoldedConvLikeWrapper(getattr(module, "stem2b"))
-        self.stem3 = _FoldedConvLikeWrapper(getattr(module, "stem3"))
-        self.stem4 = _FoldedConvLikeWrapper(getattr(module, "stem4"))
-        self.pool = getattr(module, "pool")
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.stem1(x)
-        x2 = self.stem2a(x)
-        x2 = self.stem2b(x2)
-        x1 = self.pool(x)
-        x = torch.cat([x1, x2], dim=1)
-        x = self.stem3(x)
-        x = self.stem4(x)
-        return x
-
-
-class _OpaqueModuleWrapper(nn.Module):
-    """Delegate to the original module while hiding child paths from later replacements."""
-
-    def __init__(self, module: nn.Module):
-        super().__init__()
-        self._wrapped = module
-
-    def forward(self, *args: Any, **kwargs: Any) -> Any:
-        return self._wrapped(*args, **kwargs)
-
-
-class _HGV2StageBlockCompileWrapper(nn.Module):
-    """Stage wrapper that preserves stage boundaries while compiling each block privately."""
-
-    def __init__(
-        self,
-        module: nn.Module,
-        compile_module: Callable[[nn.Module], Any],
-    ):
-        super().__init__()
-        self._downsample = None
-        if bool(getattr(module, "is_downsample", False)):
-            self._downsample = compile_module(_OpaqueModuleWrapper(getattr(module, "downsample")))
-        self._blocks = nn.ModuleList(
-            [compile_module(_OpaqueModuleWrapper(block)) for block in getattr(module, "blocks")]
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self._downsample is not None:
-            x = self._downsample(x)
-        for block in self._blocks:
-            x = block(x)
-        return x
-
-
-class _EncoderWithSVTRFusedWrapper(nn.Module):
-    """Inference-only wrapper that folds the encoder-side ConvBN layers around the SVTR blocks."""
-
-    def __init__(self, module: nn.Module):
-        super().__init__()
-        self.use_guide = bool(getattr(module, "use_guide", False))
-        self.conv1 = _FoldedConvLikeWrapper(getattr(module, "conv1"))
-        self.conv2 = _FoldedConvLikeWrapper(getattr(module, "conv2"))
-        self.svtr_block = getattr(module, "svtr_block")
-        self.norm = getattr(module, "norm")
-        self.conv3 = _FoldedConvLikeWrapper(getattr(module, "conv3"))
-        self.conv4 = _FoldedConvLikeWrapper(getattr(module, "conv4"))
-        self.conv1x1 = _FoldedConvLikeWrapper(getattr(module, "conv1x1"))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        z = x.clone() if self.use_guide else x
-        h = z
-        z = self.conv1(z)
-        z = self.conv2(z)
-        _, c, h_dim, w_dim = z.shape
-        z = z.flatten(2).permute(0, 2, 1)
-        for block in self.svtr_block:
-            z = block(z)
-        z = self.norm(z)
-        z = z.reshape([-1, h_dim, w_dim, c]).permute(0, 3, 1, 2)
-        z = self.conv3(z)
-        z = torch.cat((h, z), dim=1)
-        z = self.conv1x1(self.conv4(z))
-        return z
-
-
-class _SVTRAttentionSDPAWrapper(nn.Module):
-    """Global SVTR attention rewritten with scaled_dot_product_attention."""
-
-    def __init__(self, module: nn.Module):
-        super().__init__()
-        if getattr(module, "mixer", None) != "Global":
-            raise ValueError("SVTR SDPA wrapper only supports global attention mixers")
-        self.num_heads = int(getattr(module, "num_heads"))
-        self.scale = float(getattr(module, "scale"))
-        self.qkv = getattr(module, "qkv")
-        self.proj = getattr(module, "proj")
-        self.proj_drop = getattr(module, "proj_drop")
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        bsz, tokens, channels = x.shape
-        head_dim = channels // self.num_heads
-        qkv = self.qkv(x).reshape(bsz, tokens, 3, self.num_heads, head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)
-        x = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            dropout_p=0.0,
-            scale=self.scale,
-        )
-        x = x.transpose(1, 2).reshape(bsz, tokens, channels)
-        x = self.proj(x)
-        return self.proj_drop(x)
-
-
-class _SVTRBlockSDPAWrapper(nn.Module):
-    """SVTR block wrapper that preserves the residual structure while swapping in SDPA."""
-
-    def __init__(self, module: nn.Module):
-        super().__init__()
-        self.norm1 = getattr(module, "norm1")
-        self.mixer = _SVTRAttentionSDPAWrapper(getattr(module, "mixer"))
-        self.drop_path = getattr(module, "drop_path")
-        self.norm2 = getattr(module, "norm2")
-        self.mlp = getattr(module, "mlp")
-        self.prenorm = bool(getattr(module, "prenorm", False))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.prenorm:
-            x = self.norm1(x + self.drop_path(self.mixer(x)))
-            x = self.norm2(x + self.drop_path(self.mlp(x)))
-        else:
-            x = x + self.drop_path(self.mixer(self.norm1(x)))
-            x = x + self.drop_path(self.mlp(self.norm2(x)))
-        return x
-
-
-class _EncoderWithSVTRFusedSDPAWrapper(nn.Module):
-    """Fold encoder-side ConvBN layers and replace SVTR attention blocks with SDPA."""
-
-    def __init__(self, module: nn.Module):
-        super().__init__()
-        self.use_guide = bool(getattr(module, "use_guide", False))
-        self.conv1 = _FoldedConvLikeWrapper(getattr(module, "conv1"))
-        self.conv2 = _FoldedConvLikeWrapper(getattr(module, "conv2"))
-        self.svtr_block = nn.ModuleList(
-            [_SVTRBlockSDPAWrapper(block) for block in getattr(module, "svtr_block")]
-        )
-        self.norm = getattr(module, "norm")
-        self.conv3 = _FoldedConvLikeWrapper(getattr(module, "conv3"))
-        self.conv4 = _FoldedConvLikeWrapper(getattr(module, "conv4"))
-        self.conv1x1 = _FoldedConvLikeWrapper(getattr(module, "conv1x1"))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        z = x.clone() if self.use_guide else x
-        h = z
-        z = self.conv1(z)
-        z = self.conv2(z)
-        _, c, h_dim, w_dim = z.shape
-        z = z.flatten(2).permute(0, 2, 1)
-        for block in self.svtr_block:
-            z = block(z)
-        z = self.norm(z)
-        z = z.reshape([-1, h_dim, w_dim, c]).permute(0, 3, 1, 2)
-        z = self.conv3(z)
-        z = torch.cat((h, z), dim=1)
-        z = self.conv1x1(self.conv4(z))
-        return z
 
 
 class _BatchNormWrapper(nn.Module):
@@ -1234,101 +678,6 @@ class _RMSNormWrapper(nn.Module):
             out = out.reshape(orig_shape)
 
         return out
-
-
-def _clone_graph_value(value: Any) -> Any:
-    if isinstance(value, torch.Tensor):
-        cloned = torch.empty_like(value, memory_format=torch.preserve_format)
-        cloned.copy_(value)
-        return cloned
-    if isinstance(value, dict):
-        return {k: _clone_graph_value(v) for k, v in value.items()}
-    if isinstance(value, tuple):
-        return tuple(_clone_graph_value(v) for v in value)
-    if isinstance(value, list):
-        return [_clone_graph_value(v) for v in value]
-    return value
-
-
-def _graph_value_like(value: Any) -> Any:
-    if isinstance(value, torch.Tensor):
-        return torch.empty_like(value, memory_format=torch.preserve_format)
-    if isinstance(value, dict):
-        return {k: _graph_value_like(v) for k, v in value.items()}
-    if isinstance(value, tuple):
-        return tuple(_graph_value_like(v) for v in value)
-    if isinstance(value, list):
-        return [_graph_value_like(v) for v in value]
-    return value
-
-
-def _copy_graph_value_(dst: Any, src: Any) -> None:
-    if isinstance(dst, torch.Tensor):
-        if not isinstance(src, torch.Tensor):
-            raise TypeError(f"Expected tensor input for CUDA graph replay, got {type(src)}")
-        dst.copy_(src)
-        return
-    if isinstance(dst, dict):
-        if not isinstance(src, dict) or dst.keys() != src.keys():
-            raise TypeError("CUDA graph replay requires matching dict inputs")
-        for key in dst:
-            _copy_graph_value_(dst[key], src[key])
-        return
-    if isinstance(dst, tuple):
-        if not isinstance(src, tuple) or len(dst) != len(src):
-            raise TypeError("CUDA graph replay requires matching tuple inputs")
-        for dst_item, src_item in zip(dst, src):
-            _copy_graph_value_(dst_item, src_item)
-        return
-    if isinstance(dst, list):
-        if not isinstance(src, list) or len(dst) != len(src):
-            raise TypeError("CUDA graph replay requires matching list inputs")
-        for dst_item, src_item in zip(dst, src):
-            _copy_graph_value_(dst_item, src_item)
-        return
-    if dst != src:
-        raise TypeError("CUDA graph replay requires static non-tensor inputs")
-
-
-def _graph_values_share_storage(dst: Any, src: Any) -> bool:
-    if isinstance(dst, torch.Tensor):
-        return (
-            isinstance(src, torch.Tensor)
-            and dst.data_ptr() == src.data_ptr()
-            and tuple(dst.shape) == tuple(src.shape)
-            and tuple(dst.stride()) == tuple(src.stride())
-            and dst.dtype == src.dtype
-            and dst.device == src.device
-        )
-    if isinstance(dst, dict):
-        return (
-            isinstance(src, dict)
-            and dst.keys() == src.keys()
-            and all(_graph_values_share_storage(dst[key], src[key]) for key in dst)
-        )
-    if isinstance(dst, tuple):
-        return (
-            isinstance(src, tuple)
-            and len(dst) == len(src)
-            and all(_graph_values_share_storage(dst_item, src_item) for dst_item, src_item in zip(dst, src))
-        )
-    if isinstance(dst, list):
-        return (
-            isinstance(src, list)
-            and len(dst) == len(src)
-            and all(_graph_values_share_storage(dst_item, src_item) for dst_item, src_item in zip(dst, src))
-        )
-    return dst == src
-
-
-def _call_model_forward(forward_fn: Callable[..., Any], model_input: Any) -> Any:
-    if isinstance(model_input, dict):
-        return forward_fn(**model_input)
-    if isinstance(model_input, tuple):
-        return forward_fn(*model_input)
-    if isinstance(model_input, list):
-        return forward_fn(*model_input)
-    return forward_fn(model_input)
 
 
 def _pair_or_none(value: Any) -> Optional[Tuple[int, int]]:
@@ -1478,21 +827,6 @@ class OptimizedModelContext:
                 repl.generic_fallback = bool(getattr(kernel_mod, "GENERIC_FALLBACK", False))
                 repl.fuse_batchnorm_act = bool(getattr(kernel_mod, "FUSE_BATCHNORM_ACT", False))
                 repl.global_channels_last = bool(getattr(kernel_mod, "GLOBAL_CHANNELS_LAST", False))
-                repl.global_cuda_graph = bool(getattr(kernel_mod, "GLOBAL_CUDA_GRAPH", False))
-                repl.cuda_graph_warmup_iters = int(getattr(kernel_mod, "CUDA_GRAPH_WARMUP_ITERS", 3))
-                repl.cuda_graph_input_mode = str(
-                    getattr(kernel_mod, "CUDA_GRAPH_INPUT_MODE", "clone")
-                ).strip().lower()
-                repl.cuda_graph_output_mode = str(
-                    getattr(kernel_mod, "CUDA_GRAPH_OUTPUT_MODE", "clone")
-                ).strip().lower()
-                repl.block_fusion_kind = getattr(kernel_mod, "BLOCK_FUSION_KIND", None)
-                target_modules = getattr(kernel_mod, "TARGET_MODULES", None)
-                repl.target_modules = list(target_modules) if isinstance(target_modules, (list, tuple)) else None
-                repl.torch_compile_backend = getattr(kernel_mod, "TORCH_COMPILE_BACKEND", None)
-                repl.torch_compile_mode = getattr(kernel_mod, "TORCH_COMPILE_MODE", None)
-                compile_options = getattr(kernel_mod, "TORCH_COMPILE_OPTIONS", None)
-                repl.torch_compile_options = compile_options if isinstance(compile_options, dict) else None
                 repl.verify_atol = getattr(kernel_mod, "VERIFY_ATOL", None)
                 repl.verify_rtol = getattr(kernel_mod, "VERIFY_RTOL", None)
                 loaded_repls.append(repl)
@@ -1510,7 +844,6 @@ class OptimizedModelContext:
                 continue
 
         handled_group_types: set[str] = set()
-        loaded_repls = self._resolve_replacement_conflicts(loaded_repls)
         grouped: Dict[str, List[KernelReplacement]] = {}
         for repl in loaded_repls:
             grouped.setdefault(repl.kernel_type, []).append(repl)
@@ -1549,7 +882,7 @@ class OptimizedModelContext:
                     else:
                         reason = (
                             "No reinsertion strategy for this operator family. "
-                            "Current verifier support is limited to matmul, conv2d, batchnorm, layout_transform, graph_capture, layernorm, rmsnorm, and softmax."
+                            "Current verifier support is limited to matmul, conv2d, batchnorm, layout_transform, layernorm, rmsnorm, and softmax."
                         )
                     self._skipped_replacements.append(
                         {
@@ -1563,70 +896,9 @@ class OptimizedModelContext:
 
         return self.model
 
-    def _resolve_replacement_conflicts(
-        self,
-        replacements: List[KernelReplacement],
-    ) -> List[KernelReplacement]:
-        chosen_graph_capture: Optional[KernelReplacement] = None
-        for repl in replacements:
-            if repl.kernel_type != "graph_capture":
-                continue
-            if chosen_graph_capture is None or self._replacement_precedence(repl) >= self._replacement_precedence(chosen_graph_capture):
-                chosen_graph_capture = repl
-
-        chosen_block_targets: Dict[Tuple[str, ...], KernelReplacement] = {}
-        for repl in replacements:
-            if repl.kernel_type != "block_fusion" or not repl.target_modules:
-                continue
-            key = tuple(sorted(repl.target_modules))
-            current = chosen_block_targets.get(key)
-            if current is None or self._replacement_precedence(repl) >= self._replacement_precedence(current):
-                chosen_block_targets[key] = repl
-
-        resolved: List[KernelReplacement] = []
-        for repl in replacements:
-            if repl.kernel_type == "graph_capture":
-                if chosen_graph_capture is not repl:
-                    self._skipped_replacements.append(
-                        {
-                            "type": repl.kernel_type,
-                            "rank": repl.rank,
-                            "speedup": repl.speedup,
-                            "path": repl.optimized_path,
-                            "reason": "Superseded by a higher-priority graph capture candidate.",
-                        }
-                    )
-                    continue
-            if repl.kernel_type == "block_fusion" and repl.target_modules:
-                key = tuple(sorted(repl.target_modules))
-                chosen = chosen_block_targets.get(key)
-                if chosen is not repl:
-                    self._skipped_replacements.append(
-                        {
-                            "type": repl.kernel_type,
-                            "rank": repl.rank,
-                            "speedup": repl.speedup,
-                            "path": repl.optimized_path,
-                            "reason": (
-                                "Superseded by a higher-priority block fusion candidate "
-                                f"for {', '.join(repl.target_modules)}."
-                            ),
-                        }
-                    )
-                    continue
-            resolved.append(repl)
-        return resolved
-
-    @staticmethod
-    def _replacement_precedence(repl: KernelReplacement) -> Tuple[int, float, int]:
-        status_score = 1 if repl.status == "optimizing" else 0
-        speedup = float(repl.speedup or 0.0)
-        return (status_score, speedup, repl.rank)
-
     def __exit__(self, *exc):
         # Restore all original modules
-        for name in sorted(self._original_modules, key=lambda item: item.count(".")):
-            original = self._original_modules[name]
+        for name, original in self._original_modules.items():
             parts = name.split(".")
             parent = self.model
             for p in parts[:-1]:
@@ -1667,13 +939,9 @@ class OptimizedModelContext:
             count = self._replace_softmax_functional(repl)
         elif repl.kernel_type == "layout_transform":
             count = self._replace_layout_transform_strategy(repl)
-        elif repl.kernel_type == "graph_capture":
-            count = self._replace_cuda_graph_strategy(repl)
-        elif repl.kernel_type == "block_fusion":
-            count = self._replace_block_fusion_strategy(repl)
         else:
             print(f"  NOTE: No replacement strategy for kernel type '{repl.kernel_type}'. "
-                  f"Skipping. (Supported: matmul, conv2d, batchnorm, layout_transform, graph_capture, block_fusion, layernorm, rmsnorm, softmax)")
+                  f"Skipping. (Supported: matmul, conv2d, batchnorm, layout_transform, layernorm, rmsnorm, softmax)")
 
         return count
 
@@ -1714,185 +982,6 @@ class OptimizedModelContext:
 
         self._input_transform = transform_model_input
         return 1
-
-    def _replace_cuda_graph_strategy(self, repl: KernelReplacement) -> int:
-        if not repl.global_cuda_graph or not torch.cuda.is_available():
-            return 0
-        if self._original_forward is not None:
-            return 0
-
-        original_forward = self.model.forward
-        self._original_forward = original_forward
-        capture_forward = original_forward
-        if (
-            repl.torch_compile_backend is not None
-            or repl.torch_compile_mode is not None
-            or repl.torch_compile_options
-        ):
-            capture_forward = self._maybe_compile_callable(original_forward, repl)
-        warmup_iters = max(int(repl.cuda_graph_warmup_iters), 1)
-        input_mode = repl.cuda_graph_input_mode or "clone"
-        output_mode = repl.cuda_graph_output_mode or "clone"
-        capture_graph: Optional[torch.cuda.CUDAGraph] = None
-        static_input: Any = None
-        static_output: Any = None
-        replay_output: Any = None
-
-        def forward_with_cuda_graph(*args: Any, **kwargs: Any) -> Any:
-            nonlocal capture_graph, static_input, static_output, replay_output
-            if args and kwargs:
-                raise TypeError("CUDA graph strategy does not support mixed args and kwargs")
-
-            runtime_input: Any
-            if kwargs:
-                runtime_input = kwargs
-            elif len(args) == 1:
-                runtime_input = args[0]
-            else:
-                runtime_input = tuple(args)
-
-            if capture_graph is None:
-                if input_mode == "adopt_if_static":
-                    static_input = runtime_input
-                else:
-                    static_input = _clone_graph_value(runtime_input)
-                warmup_stream = torch.cuda.Stream()
-                warmup_stream.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(warmup_stream), torch.no_grad():
-                    for _ in range(warmup_iters):
-                        _call_model_forward(capture_forward, static_input)
-                torch.cuda.current_stream().wait_stream(warmup_stream)
-
-                capture_graph = torch.cuda.CUDAGraph()
-                with torch.no_grad():
-                    with torch.cuda.graph(capture_graph):
-                        static_output = _call_model_forward(capture_forward, static_input)
-                capture_graph.replay()
-                if output_mode == "static":
-                    return static_output
-                if output_mode == "reuse_copy":
-                    replay_output = _graph_value_like(static_output)
-                    _copy_graph_value_(replay_output, static_output)
-                    return replay_output
-                return _clone_graph_value(static_output)
-
-            if not (input_mode == "adopt_if_static" and _graph_values_share_storage(static_input, runtime_input)):
-                _copy_graph_value_(static_input, runtime_input)
-            capture_graph.replay()
-            if output_mode == "static":
-                return static_output
-            if output_mode == "reuse_copy":
-                if replay_output is None:
-                    replay_output = _graph_value_like(static_output)
-                _copy_graph_value_(replay_output, static_output)
-                return replay_output
-            return _clone_graph_value(static_output)
-
-        self.model.forward = forward_with_cuda_graph
-        return 1
-
-    def _replace_block_fusion_strategy(self, repl: KernelReplacement) -> int:
-        targets = repl.target_modules or []
-        if not targets:
-            return 0
-
-        count = 0
-        for target in targets:
-            parent, attr = _get_named_parent(self.model, target)
-            if parent is None or attr is None or not hasattr(parent, attr):
-                continue
-            original = getattr(parent, attr)
-            compile_after = True
-            if repl.block_fusion_kind == "compile_original":
-                replacement = original
-            elif repl.block_fusion_kind == "hgv2_stage":
-                replacement = _HGV2StageFusedWrapper(original)
-            elif repl.block_fusion_kind == "hgv2_stage_prealloc_cat":
-                replacement = _HGV2StagePreallocCatWrapper(original)
-            elif repl.block_fusion_kind == "hgv2_stage_squeeze_accumulate":
-                replacement = _HGV2StageSqueezeAccumulateWrapper(original)
-            elif repl.block_fusion_kind == "hgv2_stage_compile_blocks":
-                replacement = _HGV2StageBlockCompileWrapper(
-                    original,
-                    lambda module: self._maybe_compile_module(module, repl),
-                )
-                compile_after = False
-            elif repl.block_fusion_kind == "hgv2_stage_blocks_only":
-                replacement = _HGV2StageBlocksOnlyWrapper(original)
-            elif repl.block_fusion_kind == "hgv2_block":
-                replacement = _HGV2BlockFusedWrapper(original)
-            elif repl.block_fusion_kind == "stem_block":
-                replacement = _StemBlockFusedWrapper(original)
-            elif repl.block_fusion_kind == "svtr_encoder":
-                replacement = _EncoderWithSVTRFusedWrapper(original)
-            elif repl.block_fusion_kind == "svtr_encoder_sdpa":
-                replacement = _EncoderWithSVTRFusedSDPAWrapper(original)
-            elif repl.block_fusion_kind == "compile_opaque":
-                replacement = _OpaqueModuleWrapper(original)
-            else:
-                continue
-            if compile_after:
-                replacement = self._maybe_compile_module(replacement, repl)
-            self._original_modules[target] = original
-            setattr(parent, attr, replacement)
-            count += 1
-        return count
-
-    def _maybe_compile_module(self, module: nn.Module, repl: KernelReplacement) -> Any:
-        backend = repl.torch_compile_backend
-        mode = repl.torch_compile_mode
-        options = repl.torch_compile_options
-        if backend is None and mode is None and not options:
-            return module
-        if not hasattr(torch, "compile"):
-            print("  WARNING: torch.compile requested but not available; using eager wrapper")
-            return module
-        if mode is not None and options:
-            print("  WARNING: torch.compile mode and options are mutually exclusive; using eager wrapper")
-            return module
-
-        kwargs: Dict[str, Any] = {}
-        if backend is not None:
-            kwargs["backend"] = backend
-        if mode is not None:
-            kwargs["mode"] = mode
-        if options:
-            kwargs["options"] = options
-
-        try:
-            _ensure_stdlib_profile_module_for_compile()
-            return torch.compile(module, **kwargs)
-        except Exception as exc:
-            print(f"  WARNING: torch.compile failed for {repl.optimized_path}: {exc}")
-            return module
-
-    def _maybe_compile_callable(self, fn: Callable[..., Any], repl: KernelReplacement) -> Callable[..., Any]:
-        backend = repl.torch_compile_backend
-        mode = repl.torch_compile_mode
-        options = repl.torch_compile_options
-        if backend is None and mode is None and not options:
-            return fn
-        if not hasattr(torch, "compile"):
-            print("  WARNING: torch.compile requested but not available; using eager callable")
-            return fn
-        if mode is not None and options:
-            print("  WARNING: torch.compile mode and options are mutually exclusive; using eager callable")
-            return fn
-
-        kwargs: Dict[str, Any] = {}
-        if backend is not None:
-            kwargs["backend"] = backend
-        if mode is not None:
-            kwargs["mode"] = mode
-        if options:
-            kwargs["options"] = options
-
-        try:
-            _ensure_stdlib_profile_module_for_compile()
-            return torch.compile(fn, **kwargs)
-        except Exception as exc:
-            print(f"  WARNING: torch.compile failed for {repl.optimized_path}: {exc}")
-            return fn
 
     def _apply_group_replacement(
         self,
@@ -2035,7 +1124,7 @@ class OptimizedModelContext:
             fused_norm = None
             fused_act = None
             if fusion_shapes and any(_conv_module_may_match_shape(shape, module) for shape in fusion_shapes):
-                parent_module, parent_attr = _get_named_parent(self.model, parent_name)
+                parent_module, parent_attr = _get_named_parent(self.model, name)
                 if parent_module is not None and parent_attr:
                     fused_parent = getattr(parent_module, parent_attr, None)
                     fused_norm = (

@@ -3,8 +3,6 @@
 You are an autonomous GPU kernel optimization researcher. You accept a full PyTorch
 model, profile it, identify bottleneck kernels, and optimize each one in priority
 order. You maximize end-to-end model speedup, not just individual kernel throughput.
-For PP-OCR work, the acceptance metric is full `PPOCRv5ServerRecModel` latency, not
-standalone `bench.py` TFLOPS.
 
 ---
 
@@ -66,7 +64,7 @@ cat workspace/profile_report.json
 Look for:
 - The top 5-10 ops by time percentage
 - Whether the model is compute-bound or memory-bound overall
-- Which op types dominate (matmul, conv2d, batchnorm, layout/transform, normalization, etc.)
+- Which op types dominate (matmul, attention, normalization, etc.)
 
 Present findings to the human in a clear summary:
 
@@ -104,10 +102,7 @@ workspace/
 
 ### A5. Present the optimization plan
 
-Use Amdahl's law to estimate the maximum possible speedup for each kernel. For PP-OCR,
-prioritize the recognizer's highest-impact kernels first, especially `conv2d`,
-`batchnorm`, layout/transform kernels, and any existing softmax/layernorm reinsertion
-paths that measurably improve recognizer latency:
+Use Amdahl's law to estimate the maximum possible speedup for each kernel:
 
 ```
 Amdahl's Law Estimates (assuming 2x speedup on each kernel):
@@ -143,12 +138,12 @@ Use a descriptive tag like `mar10-llama7b`.
 
 Read every file in the repo:
 - `README.md` -- repository context and design philosophy
-- `bench.py` -- kernel-level correctness and diagnostic benchmark harness
-- `reference.py` -- PyTorch reference implementations
-- `prepare.py` -- one-time setup
+- `bench.py` -- fixed benchmark and correctness harness (do not modify)
+- `reference.py` -- PyTorch reference implementations (do not modify)
+- `prepare.py` -- one-time setup (do not modify)
 - `kernel.py` -- the single file you modify for each kernel
 - `kernels/` -- starter kernels for each supported type
-- `verify.py` -- end-to-end verification and latency measurement harness
+- `verify.py` -- end-to-end verification (do not modify)
 - `workspace/` -- extracted kernels and state
 
 ### A9. Verify environment
@@ -206,19 +201,10 @@ Verify:
 uv run bench.py > run.log 2>&1
 ```
 
-Then capture the real acceptance baseline with end-to-end verification on the target
-model. For PP-OCR recognizer runs, this is the primary metric:
+Record this as the baseline:
 
 ```bash
-uv run verify.py --model models/ppocrv5_server.py --class-name PPOCRv5ServerRecModel \
-  --input-shape 1,3,48,320 --warmup 10 --timed 50
-```
-
-Record the recognizer-latency baseline with the orchestrator:
-
-```bash
-uv run orchestrate.py record kernel_<type>_<rank>.py <latency_ms> keep "baseline" \
-  --metric-name recognizer_latency_ms
+uv run orchestrate.py record kernel_<type>_<rank>.py <tflops> keep "baseline"
 ```
 
 ### B4. Single-kernel experiment loop
@@ -278,13 +264,6 @@ If grep returns nothing, the run crashed. Read the traceback:
 tail -n 50 run.log
 ```
 
-Then run end-to-end verification for the actual acceptance signal:
-
-```bash
-uv run verify.py --model models/ppocrv5_server.py --class-name PPOCRv5ServerRecModel \
-  --input-shape 1,3,48,320 --warmup 10 --timed 50
-```
-
 #### 6. Decide: KEEP or REVERT
 
 Apply these rules strictly, in order:
@@ -292,21 +271,19 @@ Apply these rules strictly, in order:
 | Condition | Action |
 |-----------|--------|
 | correctness = FAIL | **REVERT** immediately. `git reset --hard HEAD~1`. Never keep an incorrect kernel. |
-| correctness = PASS, recognizer latency improved | **KEEP**. This is the new baseline. |
-| correctness = PASS, recognizer latency unchanged or worse | **REVERT**. `git reset --hard HEAD~1`. |
+| correctness = PASS, throughput improved | **KEEP**. This is the new baseline. |
+| correctness = PASS, throughput same or worse | **REVERT**. `git reset --hard HEAD~1`. |
 
-"Improved" means a real reduction in end-to-end recognizer latency beyond noise. Use
-`bench.py` throughput and roofline data to understand why, but do not accept a future
-kernel family unless it helps the full recognizer.
+"Improved" means at least 1% gain in `throughput_tflops`. Noise-level changes should be
+reverted unless the code is simpler.
 
-**Special case**: Keep the current softmax/layernorm reinsertion path, but only keep
-future softmax/layernorm kernels if the recognizer gets faster.
+**Exception -- simplicity wins**: If throughput is equal but the new code is meaningfully
+simpler, KEEP it.
 
 #### 7. Record with orchestrator
 
 ```bash
-uv run orchestrate.py record <file> <latency_ms> keep|revert "<description>" \
-  --metric-name recognizer_latency_ms
+uv run orchestrate.py record <file> <tflops> keep|revert "<description>"
 ```
 
 #### 8. Analyze roofline
@@ -357,7 +334,7 @@ uv run orchestrate.py status
 ```
 
 This shows:
-- Per-kernel: baseline vs current best, using recognizer latency when available
+- Per-kernel: baseline vs current best, speedup, experiments run
 - Aggregate: estimated end-to-end model speedup (Amdahl's law)
 - Remaining: which kernels are left, estimated time
 
@@ -372,10 +349,10 @@ FOR each kernel in priority order:
     B1. Check orchestrator: uv run orchestrate.py next
     B2. If DONE → go to Phase C
     B3. Copy kernel: cp workspace/kernel_{type}_{rank}.py kernel.py
-    B4. Run kernel benchmark: uv run bench.py > run.log 2>&1
-    B5. Run end-to-end verifier and record baseline recognizer latency
+    B4. Run baseline: uv run bench.py > run.log 2>&1
+    B5. Record baseline: uv run orchestrate.py record <file> <tflops> keep "baseline"
     B6. LOOP (single-kernel optimization):
-        - Hypothesize, edit, commit, run, verify recognizer latency, keep/revert
+        - Hypothesize, edit, commit, run, check, keep/revert
         - uv run orchestrate.py record ...
         - uv run orchestrate.py next → break if not CONTINUE
     B7. Save: cp kernel.py workspace/kernel_{type}_{rank}_optimized.py
@@ -405,8 +382,7 @@ uv run verify.py --module transformers --class-name AutoModelForCausalLM \
 The verifier:
 1. Loads the model
 2. Runs inference with original PyTorch ops (reference)
-3. Replaces optimized modules (for example `nn.Linear`, `nn.Conv2d`, `nn.BatchNorm*`,
-   `nn.LayerNorm`, and the existing PP-OCR softmax reinsertion path when supported)
+3. Replaces optimized modules (nn.Linear with matmul kernel, nn.LayerNorm with layernorm kernel, etc.)
 4. Runs inference with optimized kernels
 5. Compares outputs for correctness
 6. Reports end-to-end speedup
@@ -416,7 +392,7 @@ The verifier:
 | Result | Action |
 |--------|--------|
 | correctness: PASS, speedup > 1.0 | Success. Generate final report. |
-| correctness: PASS, speedup <= 1.0 | Reject the candidate. Kernel-level gains did not help end-to-end latency. |
+| correctness: PASS, speedup <= 1.0 | Kernel overhead is too high. Review replacement strategy. |
 | correctness: FAIL | Run diagnosis mode to find the culprit. |
 
 ### C3. Diagnose failures
@@ -877,7 +853,7 @@ Each benchmark should complete in ~90 seconds. If a run exceeds 3 minutes, it is
 **Action on timeout:**
 1. Kill the process: `kill %1` or `pkill -f bench.py`
 2. Revert: `git reset --hard HEAD~1`
-3. Log in results.tsv with a timeout marker and `correctness=TIMEOUT`
+3. Log in results.tsv with `throughput_tflops=0`, `correctness=TIMEOUT`
 4. Move on.
 
 ### Crashes
@@ -902,20 +878,21 @@ Each benchmark should complete in ~90 seconds. If a run exceeds 3 minutes, it is
 
 These are hard rules. Violating any of them is a bug.
 
-1. **Do not weaken correctness checks in `bench.py`, `reference.py`, or `verify.py`**.
-2. **Keep `prepare.py` limited to one-time setup responsibilities**.
-3. **If you change `profile.py`, `extract.py`, or `orchestrate.py`, keep them aligned** so profiling, extraction, reinsertion, and reporting describe the same operator families and acceptance metric.
-4. **Never add dependencies**. You can only use what is already in `pyproject.toml`.
-5. **Never skip correctness**. Every experiment must pass correctness checks.
-6. **Simpler code wins when performance is equal**.
-7. **VRAM must not exceed 80% of GPU memory**. If `peak_vram_mb` exceeds 80%, treat as regression and revert.
-8. **Do not commit `results.tsv`** or **`run.log`** -- leave them untracked.
-9. **Save optimized kernels to workspace**. Always copy `kernel.py` to `workspace/kernel_<type>_<rank>_optimized.py` before moving to the next kernel.
-10. **Record every experiment with the orchestrator**.
-11. **Respect orchestrator decisions**. If it says move on, move on.
-12. **One kernel at a time**. Do not try to optimize two kernels simultaneously.
-13. **For PP-OCR recognizer work, accept kernels on end-to-end latency, not standalone throughput**.
-14. **Keep the existing softmax/layernorm reinsertion path intact unless an end-to-end regression forces a revert**.
+1. **Never modify `bench.py`**. This is the fixed evaluation harness.
+2. **Never modify `reference.py`**. These are the correctness oracles.
+3. **Never modify `prepare.py`**. This handles one-time setup.
+4. **Never modify `verify.py`**. This is the end-to-end verification harness.
+5. **Never modify `profile.py`** or **`extract.py`**. These are the analysis tools.
+6. **Never modify `orchestrate.py`**. This is the orchestration engine.
+7. **Never add dependencies**. You can only use what is already in `pyproject.toml`.
+8. **Never skip correctness**. Every experiment must pass correctness checks.
+9. **Simpler code wins when performance is equal**.
+10. **VRAM must not exceed 80% of GPU memory**. If `peak_vram_mb` exceeds 80%, treat as regression and revert.
+11. **Do not commit `results.tsv`** or **`run.log`** -- leave them untracked.
+12. **Save optimized kernels to workspace**. Always copy `kernel.py` to `workspace/kernel_<type>_<rank>_optimized.py` before moving to the next kernel.
+13. **Record every experiment with the orchestrator**.
+14. **Respect orchestrator decisions**. If it says move on, move on.
+15. **One kernel at a time**. Do not try to optimize two kernels simultaneously.
 
 ---
 
